@@ -35,6 +35,8 @@ function showAuthenticatedUI(user) {
     // Set user info
     document.getElementById('userName').textContent = user.name || 'User';
     document.getElementById('userEmail').textContent = user.email || '';
+    console.log('User:', user);
+    document.getElementById('avatar-img').src = user.picture || 'user.png';
 }
 
 // Handle Google Sign-In button click

@@ -38,6 +38,8 @@ SCOPES = [
     "https://www.googleapis.com/auth/userinfo.email",
     "https://www.googleapis.com/auth/calendar.readonly",
     "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/gmail.readonly",
+
 ]
 
 # OAuth flow configuration
@@ -248,24 +250,115 @@ async def get_profile(request: Request):
 
 @app.get("/api/email")
 async def get_email(request: Request):
-    """Placeholder endpoint for email access"""
+    """
+    返回 Primary 里面最近 90 天的邮件
+    默认取最近 100 封（可以按需调 maxResults）
+    """
     credentials = get_credentials_from_cookies(request)
     if not credentials:
         return JSONResponse({"error": "Not authenticated"}, status_code=401)
 
-    # TODO: Implement email access using credentials
-    return {"message": "Email access endpoint - to be implemented", "authenticated": True}
+    try:
+        from googleapiclient.discovery import build
+
+        service = build("gmail", "v1", credentials=credentials)
+
+        # 只要 Primary + 最近 90 天
+        gmail_query = "category:primary newer_than:90d"
+
+        # 拉取符合条件的邮件 ID（这里限制 100 封，按需调节）
+        results = service.users().messages().list(
+            userId="me",
+            q=gmail_query,
+            maxResults=100,
+        ).execute()
+
+        messages = results.get("messages", [])
+
+        email_list = []
+        for msg in messages:
+            msg_detail = service.users().messages().get(
+                userId="me", id=msg["id"]
+            ).execute()
+
+            snippet = msg_detail.get("snippet", "")
+
+            headers = msg_detail.get("payload", {}).get("headers", [])
+            subject = next(
+                (h["value"] for h in headers if h["name"] == "Subject"), ""
+            )
+            from_addr = next(
+                (h["value"] for h in headers if h["name"] == "From"), ""
+            )
+            date = next(
+                (h["value"] for h in headers if h["name"] == "Date"), ""
+            )
+
+            email_list.append({
+                "id": msg["id"],
+                "from": from_addr,
+                "subject": subject,
+                "date": date,
+                "snippet": snippet,
+            })
+
+        return {
+            "count": len(email_list),
+            "emails": email_list,
+            # 前端如果以后想做翻页，可以用这个 nextPageToken 再加一个参数传回来
+            "next_page_token": results.get("nextPageToken"),
+        }
+
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 @app.get("/api/calendar")
 async def get_calendar(request: Request):
-    """Placeholder endpoint for calendar access"""
+    """
+    返回 primary 日历中所有未来的事件（最多 2500 条）
+    """
     credentials = get_credentials_from_cookies(request)
     if not credentials:
         return JSONResponse({"error": "Not authenticated"}, status_code=401)
 
-    # TODO: Implement calendar access using credentials
-    return {"message": "Calendar access endpoint - to be implemented", "authenticated": True}
+    try:
+        from googleapiclient.discovery import build
+        from datetime import datetime
+
+        service = build("calendar", "v3", credentials=credentials)
+
+        now = datetime.utcnow().isoformat() + "Z"  # RFC3339 UTC
+
+        events_result = service.events().list(
+            calendarId="primary",
+            timeMin=now,
+            maxResults=2500,        # Google Calendar API 上限
+            singleEvents=True,      # 展开重复事件
+            orderBy="startTime"
+        ).execute()
+
+        events = events_result.get("items", [])
+
+        formatted = []
+        for e in events:
+            formatted.append({
+                "id": e.get("id"),
+                "summary": e.get("summary"),
+                "description": e.get("description"),
+                "location": e.get("location"),
+                "start": e.get("start"),  # 里面有 date 或 dateTime
+                "end": e.get("end"),
+            })
+
+        return {
+            "count": len(formatted),
+            "events": formatted,
+            "next_page_token": events_result.get("nextPageToken"),
+        }
+
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 @app.get("/api/drive")
