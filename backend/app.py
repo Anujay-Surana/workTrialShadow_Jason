@@ -251,8 +251,8 @@ async def get_profile(request: Request):
 @app.get("/api/email")
 async def get_email(request: Request):
     """
-    返回 Primary 里面最近 90 天的邮件
-    默认取最近 100 封（可以按需调 maxResults）
+    Return Emails from Primary category, past 90 days.
+    default fetches the latest 100 emails from Primary category in the last 90 days, maxResults adjustable as needed.
     """
     credentials = get_credentials_from_cookies(request)
     if not credentials:
@@ -263,10 +263,10 @@ async def get_email(request: Request):
 
         service = build("gmail", "v1", credentials=credentials)
 
-        # 只要 Primary + 最近 90 天
+        # Primary category emails from last 90 days
         gmail_query = "category:primary newer_than:90d"
 
-        # 拉取符合条件的邮件 ID（这里限制 100 封，按需调节）
+        # Fetch messages
         results = service.users().messages().list(
             userId="me",
             q=gmail_query,
@@ -305,7 +305,7 @@ async def get_email(request: Request):
         return {
             "count": len(email_list),
             "emails": email_list,
-            # 前端如果以后想做翻页，可以用这个 nextPageToken 再加一个参数传回来
+            # nextPageToken is not typically provided in Gmail API list responses
             "next_page_token": results.get("nextPageToken"),
         }
 
@@ -316,7 +316,7 @@ async def get_email(request: Request):
 @app.get("/api/calendar")
 async def get_calendar(request: Request):
     """
-    返回 primary 日历中所有未来的事件（最多 2500 条）
+    returns up to 2500 upcoming events from the primary calendar
     """
     credentials = get_credentials_from_cookies(request)
     if not credentials:
@@ -333,8 +333,8 @@ async def get_calendar(request: Request):
         events_result = service.events().list(
             calendarId="primary",
             timeMin=now,
-            maxResults=2500,        # Google Calendar API 上限
-            singleEvents=True,      # 展开重复事件
+            maxResults=2500,        # Google Calendar API Limit
+            singleEvents=True,      # Expand recurring events
             orderBy="startTime"
         ).execute()
 
@@ -347,7 +347,7 @@ async def get_calendar(request: Request):
                 "summary": e.get("summary"),
                 "description": e.get("description"),
                 "location": e.get("location"),
-                "start": e.get("start"),  # 里面有 date 或 dateTime
+                "start": e.get("start"),  # can be dateTime or date
                 "end": e.get("end"),
             })
 
@@ -362,14 +362,123 @@ async def get_calendar(request: Request):
 
 
 @app.get("/api/drive")
-async def get_drive(request: Request):
-    """Placeholder endpoint for drive access"""
+async def get_drive(request: Request, path: str = "/"):
+    """
+    Google Drive path-based explorer.
+    
+    Behavior:
+    - If `path` points to a folder → return folder info + children list.
+    - If `path` points to a file   → return file info (same format as folder children).
+    
+    Path examples:
+        /                → Drive root
+        /Reports         → Folder "Reports"
+        /Reports/a.pdf   → File inside Reports
+    
+    Note:
+        - User must grant https://www.googleapis.com/auth/drive.readonly
+        - Download URLs require Bearer token in headers.
+    """
+
     credentials = get_credentials_from_cookies(request)
     if not credentials:
         return JSONResponse({"error": "Not authenticated"}, status_code=401)
 
-    # TODO: Implement drive access using credentials
-    return {"message": "Drive access endpoint - to be implemented", "authenticated": True}
+    try:
+        from googleapiclient.discovery import build
+
+        # Normalize path
+        path = path.strip()
+        if path == "":
+            path = "/"
+
+        service = build("drive", "v3", credentials=credentials)
+        
+        # 1. Resolve path to Drive file/folder ID
+
+        root_id = "root"
+
+        def find_item_by_name(parent_id, name):
+            """Find a direct child inside parent folder by exact name."""
+            query = f"'{parent_id}' in parents and name = '{name}' and trashed = false"
+            result = service.files().list(
+                q=query,
+                fields="files(id, name, mimeType, size, modifiedTime)"
+            ).execute()
+            files = result.get("files", [])
+            return files[0] if files else None
+
+        def resolve_path(path: str):
+            """Resolve hierarchical path into a Drive file or folder."""
+            if path in ["", "/"]:
+                return {"id": root_id, "is_folder": True, "name": ""}
+
+            parts = [p for p in path.split("/") if p]
+            current_id = root_id
+            item = None
+
+            for part in parts:
+                item = find_item_by_name(current_id, part)
+                if not item:
+                    return None
+                current_id = item["id"]
+
+            return {
+                "id": item["id"],
+                "is_folder": item["mimeType"] == "application/vnd.google-apps.folder",
+                "name": item["name"],
+                "meta": item,
+            }
+
+        target = resolve_path(path)
+        if not target:
+            return JSONResponse({"error": f"Path not found: {path}"}, status_code=404)
+
+        file_id = target["id"]
+
+        # 2. Common helper: build file metadata
+        
+        def file_metadata(f):
+            """Return unified metadata format for a file."""
+            is_folder = f["mimeType"] == "application/vnd.google-apps.folder"
+
+            return {
+                "id": f["id"],
+                "name": f["name"],
+                "mimeType": f["mimeType"],
+                "is_folder": is_folder,
+                "size": f.get("size"),
+                "modified_time": f.get("modifiedTime"),
+                "download_url": None if is_folder else
+                    f"https://www.googleapis.com/drive/v3/files/{f['id']}?alt=media"
+            }
+
+        # 3. If it is a FILE → return file metadata
+        if not target["is_folder"]:
+            return {
+                "type": "file",
+                "path": path,
+                "info": file_metadata(target["meta"]),
+            }
+
+        # 4. If it is a FOLDER → list contents
+        
+        query = f"'{file_id}' in parents and trashed = false"
+        results = service.files().list(
+            q=query,
+            fields="files(id, name, mimeType, size, modifiedTime)"
+        ).execute()
+
+        children = [file_metadata(f) for f in results.get("files", [])]
+
+        return {
+            "type": "folder",
+            "path": path,
+            "children": children,
+        }
+
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 @app.get("/api/auth/status")
