@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Retrieval Service</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <!-- User Info Display (Top Right) -->
+    <div id="userInfo" class="user-info hidden">
+        <div class="user-details">
+            <span id="userName"></span>
+            <span id="userEmail"></span>
+        </div>
+        <button id="signOutBtn" class="sign-out-btn">Sign Out</button>
+    </div>
+
+    <!-- Main Content -->
+    <div class="container">
+        <!-- Sign In Section -->
+        <div id="signInSection" class="sign-in-section">
+            <button id="googleSignInBtn" class="google-sign-in-btn">
+                Sign in with Google
+            </button>
+        </div>
+
+        <!-- Search Bar Section (shown after auth) -->
+        <div id="searchSection" class="search-section hidden">
+            <input 
+                type="text" 
+                id="searchInput" 
+                class="search-input" 
+                placeholder="Search..."
+            />
+        </div>
+    </div>
+
+    <!-- Success Notification Modal (Bottom Right) -->
+    <div id="successModal" class="success-modal hidden">
+        <div class="success-content">
+            Google connected successfully
+        </div>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>
+
