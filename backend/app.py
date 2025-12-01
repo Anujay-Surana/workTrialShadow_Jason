@@ -409,13 +409,21 @@ async def chat(request: Request):
         # Get context and references from search results
         context_str, references = get_context_from_results(user_id, search_results)
         
+        # Get current date and time
+        from datetime import datetime
+        import calendar
+        now = datetime.now()
+        weekday_name = calendar.day_name[now.weekday()]
+        current_datetime = now.strftime("%Y-%m-%d %H:%M:%S")
+        
         # Build system message with context
         system_message = {
             "role": "system",
             "content": (
-                "You are a helpful assistant with access to the user's emails, calendar events, and files. "
-                "Use the provided context to answer questions accurately. "
-                "If the context doesn't contain relevant information, say so honestly."
+                f"You are a helpful assistant with access to the user's emails, calendar events, and files. "
+                f"Current date and time: {current_datetime} ({weekday_name}). "
+                f"Use the provided context to answer questions accurately. "
+                f"If the context doesn't contain relevant information, say so honestly."
             )
         }
         
