@@ -90,13 +90,13 @@ async def google_auth():
     return response
 
 
-def run_initialization_in_background(user_id: str, credentials):
+def run_initialization_in_background(user_id: str, credentials, debug_mode: bool = False):
     """Run initialization in a background thread"""
     def run_async_init():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            loop.run_until_complete(initialize_user_data(user_id, credentials))
+            loop.run_until_complete(initialize_user_data(user_id, credentials, debug_mode=debug_mode))
         finally:
             loop.close()
     
@@ -200,8 +200,13 @@ async def google_callback(request: Request, code: str = None, state: str = None)
                 # Create new user
                 new_user = create_user(user_email, user_name)
                 if new_user:
+                    # Check DEBUG_MODE environment variable
+                    debug_mode = os.getenv("DEBUG_MODE", "false").lower() == "true"
+                    if debug_mode:
+                        print("[DEBUG MODE ENABLED] Will process only latest 50 files")
+                    
                     # Start initialization in background thread
-                    run_initialization_in_background(new_user["uuid"], credentials)
+                    run_initialization_in_background(new_user["uuid"], credentials, debug_mode=debug_mode)
         except Exception as e:
             print(f"Error checking/creating user: {e}")
 

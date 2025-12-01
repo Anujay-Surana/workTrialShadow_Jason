@@ -112,10 +112,28 @@ def keyword_search(user_id: str, keywords: List[str], top_k: int = 10) -> List[D
     # Search emails
     try:
         for keyword in keywords:
-            # Search in subject and body
-            response = supabase.table('emails').select('id, subject, body').eq('user_id', user_id).or_(
-                f'subject.ilike.%{keyword}%,body.ilike.%{keyword}%'
+            # Search in subject and body using proper PostgREST OR syntax
+            # Use filter() instead of or_() to avoid syntax issues
+            response = supabase.table('emails').select('id, subject, body').eq('user_id', user_id).filter(
+                'subject', 'ilike', f'%{keyword}%'
             ).limit(top_k).execute()
+            
+            # Also search in body
+            response2 = supabase.table('emails').select('id, subject, body').eq('user_id', user_id).filter(
+                'body', 'ilike', f'%{keyword}%'
+            ).limit(top_k).execute()
+            
+            # Combine results
+            combined_data = response.data + response2.data
+            # Remove duplicates based on id
+            seen_ids = set()
+            unique_data = []
+            for item in combined_data:
+                if item['id'] not in seen_ids:
+                    seen_ids.add(item['id'])
+                    unique_data.append(item)
+            
+            response.data = unique_data[:top_k]
             
             for item in response.data:
                 # Simple scoring based on keyword matches
@@ -137,9 +155,26 @@ def keyword_search(user_id: str, keywords: List[str], top_k: int = 10) -> List[D
     # Search schedules
     try:
         for keyword in keywords:
-            response = supabase.table('schedules').select('id, summary, description').eq('user_id', user_id).or_(
-                f'summary.ilike.%{keyword}%,description.ilike.%{keyword}%'
+            # Search in summary
+            response = supabase.table('schedules').select('id, summary, description').eq('user_id', user_id).filter(
+                'summary', 'ilike', f'%{keyword}%'
             ).limit(top_k).execute()
+            
+            # Also search in description
+            response2 = supabase.table('schedules').select('id, summary, description').eq('user_id', user_id).filter(
+                'description', 'ilike', f'%{keyword}%'
+            ).limit(top_k).execute()
+            
+            # Combine and deduplicate
+            combined_data = response.data + response2.data
+            seen_ids = set()
+            unique_data = []
+            for item in combined_data:
+                if item['id'] not in seen_ids:
+                    seen_ids.add(item['id'])
+                    unique_data.append(item)
+            
+            response.data = unique_data[:top_k]
             
             for item in response.data:
                 score = 0.0
@@ -160,9 +195,26 @@ def keyword_search(user_id: str, keywords: List[str], top_k: int = 10) -> List[D
     # Search files
     try:
         for keyword in keywords:
-            response = supabase.table('files').select('id, name, summary').eq('user_id', user_id).or_(
-                f'name.ilike.%{keyword}%,summary.ilike.%{keyword}%'
+            # Search in name
+            response = supabase.table('files').select('id, name, summary').eq('user_id', user_id).filter(
+                'name', 'ilike', f'%{keyword}%'
             ).limit(top_k).execute()
+            
+            # Also search in summary
+            response2 = supabase.table('files').select('id, name, summary').eq('user_id', user_id).filter(
+                'summary', 'ilike', f'%{keyword}%'
+            ).limit(top_k).execute()
+            
+            # Combine and deduplicate
+            combined_data = response.data + response2.data
+            seen_ids = set()
+            unique_data = []
+            for item in combined_data:
+                if item['id'] not in seen_ids:
+                    seen_ids.add(item['id'])
+                    unique_data.append(item)
+            
+            response.data = unique_data[:top_k]
             
             for item in response.data:
                 score = 0.0
@@ -185,7 +237,9 @@ def keyword_search(user_id: str, keywords: List[str], top_k: int = 10) -> List[D
 
 def fuzzy_search(user_id: str, query: str, top_k: int = 10) -> List[Dict]:
     """
-    Perform fuzzy text search using PostgreSQL similarity.
+    Perform fuzzy text search using ILIKE with wildcards.
+    Note: Full-text search is not supported in Supabase Python client,
+    so we use ILIKE for fuzzy matching instead.
     
     Args:
         user_id: User UUID
@@ -197,10 +251,10 @@ def fuzzy_search(user_id: str, query: str, top_k: int = 10) -> List[Dict]:
     """
     results = []
     
-    # Search emails with fuzzy matching
+    # Search emails with fuzzy matching using ILIKE
     try:
-        response = supabase.table('emails').select('id, subject, body').eq('user_id', user_id).textSearch(
-            'subject', query, config='english'
+        response = supabase.table('emails').select('id, subject, body').eq('user_id', user_id).ilike(
+            'subject', f'%{query}%'
         ).limit(top_k).execute()
         
         for item in response.data:
@@ -215,8 +269,8 @@ def fuzzy_search(user_id: str, query: str, top_k: int = 10) -> List[Dict]:
     
     # Search schedules
     try:
-        response = supabase.table('schedules').select('id, summary, description').eq('user_id', user_id).textSearch(
-            'summary', query, config='english'
+        response = supabase.table('schedules').select('id, summary, description').eq('user_id', user_id).ilike(
+            'summary', f'%{query}%'
         ).limit(top_k).execute()
         
         for item in response.data:
@@ -231,8 +285,8 @@ def fuzzy_search(user_id: str, query: str, top_k: int = 10) -> List[Dict]:
     
     # Search files
     try:
-        response = supabase.table('files').select('id, name, summary').eq('user_id', user_id).textSearch(
-            'name', query, config='english'
+        response = supabase.table('files').select('id, name, summary').eq('user_id', user_id).ilike(
+            'name', f'%{query}%'
         ).limit(top_k).execute()
         
         for item in response.data:

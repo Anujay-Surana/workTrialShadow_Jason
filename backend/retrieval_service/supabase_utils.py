@@ -91,14 +91,24 @@ def insert_emails(user_id: str, emails: list):
         return []
 
 
-def get_emails_by_thread(user_id: str, thread_id: str):
-    """Get all emails in a thread"""
-    try:
-        response = supabase.table("emails").select("*").eq("user_id", user_id).eq("thread_id", thread_id).order("date").execute()
-        return response.data
-    except Exception as e:
-        print(f"Error getting emails by thread: {e}")
-        return []
+def get_emails_by_thread(user_id: str, thread_id: str, max_retries: int = 3):
+    """Get all emails in a thread with retry logic"""
+    import time
+    
+    for attempt in range(max_retries):
+        try:
+            response = supabase.table("emails").select("*").eq("user_id", user_id).eq("thread_id", thread_id).order("date").execute()
+            return response.data
+        except Exception as e:
+            if attempt < max_retries - 1:
+                # Exponential backoff: 0.5s, 1s, 2s
+                wait_time = 0.5 * (2 ** attempt)
+                print(f"Error getting emails by thread (attempt {attempt + 1}/{max_retries}): {e}. Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                print(f"Error getting emails by thread after {max_retries} attempts: {e}")
+                return []
+    return []
 
 
 # ======================================================
@@ -166,7 +176,8 @@ def insert_files(user_id: str, files: list):
                 "size": file.get("size"),
                 "modified_time": file.get("modified_time"),
                 "parents": file.get("parents", []),
-                "summary": None  # Will be filled during processing
+                "summary": None,  # Will be filled during processing
+                "metadata": file.get("metadata")  # Store rich metadata from Google Drive API
             })
         
         # Batch insert with upsert

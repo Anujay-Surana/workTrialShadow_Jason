@@ -1,5 +1,6 @@
 import time
 import io
+import threading
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from email.utils import parsedate_to_datetime
@@ -12,6 +13,7 @@ from retrieval_service.supabase_utils import (
     update_user_status
 )
 from retrieval_service.gemni_api_utils import embed_text
+from retrieval_service.thread_pool_manager import get_thread_pool_manager
 
 from retrieval_service.ocr_utils import extractOCR, isIMG
 from retrieval_service.doc_utils import extractDOC, isDOC
@@ -21,7 +23,7 @@ from retrieval_service.doc_utils import extractDOC, isDOC
 # Gmail: Fetch last 90 days emails (full pagination)
 # ======================================================
 
-async def fetch_gmail_messages(credentials, query="category:primary newer_than:90d", sleep_time=0.5, max_per_page=500):
+async def fetch_gmail_messages(credentials, query="(category:primary OR label:sent) newer_than:90d", sleep_time=0.5, max_per_page=500):
     service = build("gmail", "v1", credentials=credentials)
     all_emails = []
     next_page_token = None
@@ -122,14 +124,19 @@ def fetch_calendar_events(credentials, max_results=2500):
 def list_folder_children(service, folder_id):
     result = service.files().list(
         q=f"'{folder_id}' in parents and trashed = false",
-        fields="files(id, name, mimeType, size, modifiedTime, parents, owners(displayName, emailAddress))"
+        fields="files(id, name, mimeType, size, modifiedTime, parents, owners(displayName, emailAddress), ownedByMe, sharingUser(displayName, emailAddress))"
     ).execute()
     return result.get("files", [])
 
 
-def fetch_drive_all_files(credentials):
+def fetch_drive_all_files(credentials, debug_mode=False):
     """
     Recursively traverse all Google Drive files (BFS).
+    
+    Args:
+        credentials: Google OAuth credentials
+        debug_mode: If True, only returns the latest 50 files (sorted by modified_time)
+    
     Returns:
     {
         id, name, mime_type, size, modified_time, path, parents
@@ -158,9 +165,40 @@ def fetch_drive_all_files(credentials):
             )
             
             # Extract owner information
+            # Debug: Log the raw API response for first few files
+            if len(results) < 3:
+                print(f"[DEBUG] File: {name}")
+                print(f"[DEBUG] ownedByMe: {f.get('ownedByMe')}")
+                print(f"[DEBUG] owners: {f.get('owners')}")
+                print(f"[DEBUG] sharingUser: {f.get('sharingUser')}")
+            
             owners = f.get("owners", [])
             owner_emails = ", ".join([o.get("emailAddress", "") for o in owners if o.get("emailAddress")])
             owner_names = ", ".join([o.get("displayName", "") for o in owners if o.get("displayName")])
+            
+            # If file is not owned by user, try to get sharing user info
+            if not f.get("ownedByMe", True) and f.get("sharingUser"):
+                sharing_user = f.get("sharingUser", {})
+                sharing_email = sharing_user.get("emailAddress", "")
+                sharing_name = sharing_user.get("displayName", "")
+                if sharing_email:
+                    owner_emails = sharing_email
+                    owner_names = sharing_name
+            
+            # Collect metadata for richer information storage
+            metadata = {
+                "ownedByMe": f.get("ownedByMe"),
+                "owners": f.get("owners", []),
+                "sharingUser": f.get("sharingUser"),
+                "mimeType": f.get("mimeType"),
+                "webViewLink": f.get("webViewLink"),
+                "iconLink": f.get("iconLink"),
+                "thumbnailLink": f.get("thumbnailLink"),
+                "createdTime": f.get("createdTime"),
+                "modifiedByMeTime": f.get("modifiedByMeTime"),
+                "viewedByMe": f.get("viewedByMe"),
+                "viewedByMeTime": f.get("viewedByMeTime"),
+            }
 
             results.append({
                 "id": f["id"],
@@ -172,12 +210,21 @@ def fetch_drive_all_files(credentials):
                 "parents": f.get("parents", []),
                 "owner_email": owner_emails,
                 "owner_name": owner_names,
+                "metadata": metadata,
             })
 
             if is_folder:
                 queue.append((f["id"], current_path))
 
         time.sleep(0.2)
+    
+    # DEBUG mode: Sort by modified_time and limit to 50 most recent files
+    if debug_mode:
+        # Filter out folders and sort by modified_time (most recent first)
+        files_only = [f for f in results if f["mime_type"] != "application/vnd.google-apps.folder"]
+        files_only.sort(key=lambda x: x.get("modified_time", ""), reverse=True)
+        results = files_only[:50]
+        print(f"[DEBUG MODE] Limited to {len(results)} most recent files")
 
     return results
 
@@ -186,11 +233,39 @@ def fetch_drive_all_files(credentials):
 # File Processing and Download
 # ======================================================
 
-def download_file_content(credentials, file_id):
-    """Download file content from Google Drive"""
+def download_file_content(credentials, file_id, mime_type=None):
+    """Download or export file content from Google Drive"""
     try:
         service = build("drive", "v3", credentials=credentials)
-        request = service.files().get_media(fileId=file_id)
+        
+        # Check if it's a Google Workspace file that needs export
+        google_workspace_types = {
+            'application/vnd.google-apps.document': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',  # Export as DOCX
+            'application/vnd.google-apps.spreadsheet': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',  # Export as XLSX
+            'application/vnd.google-apps.presentation': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',  # Export as PPTX
+            'application/vnd.google-apps.drawing': 'application/pdf',  # Export as PDF
+        }
+        
+        print(f"[DEBUG] Downloading file {file_id}, mime_type: {mime_type}")
+        
+        # If mime_type not provided or it's a workspace file, check via API
+        if not mime_type or mime_type in google_workspace_types:
+            # Get file metadata to determine if export is needed
+            file_metadata = service.files().get(fileId=file_id, fields='mimeType').execute()
+            actual_mime_type = file_metadata.get('mimeType')
+            print(f"[DEBUG] Actual mime_type from API: {actual_mime_type}")
+            
+            if actual_mime_type in google_workspace_types:
+                export_mime_type = google_workspace_types[actual_mime_type]
+                print(f"[DEBUG] Using export with mime_type: {export_mime_type}")
+                request = service.files().export_media(fileId=file_id, mimeType=export_mime_type)
+            else:
+                print(f"[DEBUG] Using regular download")
+                request = service.files().get_media(fileId=file_id)
+        else:
+            # Regular binary file - use download
+            print(f"[DEBUG] Using regular download (non-workspace file)")
+            request = service.files().get_media(fileId=file_id)
         
         file_content = io.BytesIO()
         downloader = MediaIoBaseDownload(file_content, request)
@@ -240,8 +315,8 @@ def process_file_by_type(file_name: str, file_content: bytes) -> str:
 
 def create_email_embeddings(user_id: str, emails: list, start_progress: int, end_progress: int):
     """
-    Create embeddings for emails (3 types: email_sum, email_context, email_title)
-    Updates progress granularly as each email is processed.
+    Create embeddings for emails (3 types: email_sum, email_context, email_title) in parallel.
+    Updates progress granularly as emails are processed.
     
     Args:
         user_id: User UUID
@@ -249,16 +324,23 @@ def create_email_embeddings(user_id: str, emails: list, start_progress: int, end
         start_progress: Starting progress percentage
         end_progress: Ending progress percentage
     """
+    print(f"[DEBUG] create_email_embeddings called with {len(emails)} emails")
     if not emails:
+        print("[DEBUG] No emails to process, returning")
         return
     
     total_emails = len(emails)
     progress_range = end_progress - start_progress
-    embeddings_to_insert = []
-    last_update_progress = start_progress
     
-    for idx, email in enumerate(emails):
+    # Thread-safe progress tracking
+    progress_lock = threading.Lock()
+    processed_count = [0]
+    last_update_progress = [start_progress]
+    
+    def process_single_email(email):
+        """Process a single email and return embeddings"""
         email_id = email["id"]
+        email_embeddings = []
         
         # 1. email_sum: Full email information
         email_sum_text = (
@@ -270,7 +352,7 @@ def create_email_embeddings(user_id: str, emails: list, start_progress: int, end
         )
         try:
             email_sum_vector = embed_text(email_sum_text)
-            embeddings_to_insert.append({
+            email_embeddings.append({
                 "id": f"{email_id}_sum",
                 "user_id": user_id,
                 "type": "email_sum",
@@ -297,7 +379,7 @@ def create_email_embeddings(user_id: str, emails: list, start_progress: int, end
                     )
                 
                 email_context_vector = embed_text(thread_text)
-                embeddings_to_insert.append({
+                email_embeddings.append({
                     "id": f"{email_id}_context",
                     "user_id": user_id,
                     "type": "email_context",
@@ -319,7 +401,7 @@ def create_email_embeddings(user_id: str, emails: list, start_progress: int, end
         )
         try:
             email_title_vector = embed_text(email_title_text)
-            embeddings_to_insert.append({
+            email_embeddings.append({
                 "id": f"{email_id}_title",
                 "user_id": user_id,
                 "type": "email_title",
@@ -331,21 +413,34 @@ def create_email_embeddings(user_id: str, emails: list, start_progress: int, end
         except Exception as e:
             print(f"Error embedding email_title for {email_id}: {e}")
         
-        # Update progress if at least 1% increase
-        current_progress = start_progress + int((idx + 1) / total_emails * progress_range)
-        if current_progress - last_update_progress >= 1:
-            update_user_status(user_id, "processing", "embedding_emails", current_progress)
-            last_update_progress = current_progress
+        # Update progress (thread-safe)
+        with progress_lock:
+            processed_count[0] += 1
+            current_progress = start_progress + int(processed_count[0] / total_emails * progress_range)
+            if current_progress - last_update_progress[0] >= 1:
+                update_user_status(user_id, "processing", "embedding_emails", current_progress)
+                last_update_progress[0] = current_progress
+        
+        return email_embeddings
     
-    # Batch insert all embeddings
+    # Process emails in parallel
+    thread_pool = get_thread_pool_manager()
+    results = thread_pool.process_parallel(user_id, emails, process_single_email)
+    
+    # Flatten results and batch insert
+    embeddings_to_insert = []
+    for email_embeddings in results:
+        if email_embeddings:
+            embeddings_to_insert.extend(email_embeddings)
+    
     if embeddings_to_insert:
         batch_insert_embeddings(embeddings_to_insert)
 
 
 def create_schedule_embeddings(user_id: str, schedules: list, start_progress: int, end_progress: int):
     """
-    Create embeddings for schedules
-    Updates progress granularly as each schedule is processed.
+    Create embeddings for schedules in parallel.
+    Updates progress granularly as schedules are processed.
     
     Args:
         user_id: User UUID
@@ -358,10 +453,14 @@ def create_schedule_embeddings(user_id: str, schedules: list, start_progress: in
     
     total_schedules = len(schedules)
     progress_range = end_progress - start_progress
-    embeddings_to_insert = []
-    last_update_progress = start_progress
     
-    for idx, schedule in enumerate(schedules):
+    # Thread-safe progress tracking
+    progress_lock = threading.Lock()
+    processed_count = [0]
+    last_update_progress = [start_progress]
+    
+    def process_single_schedule(schedule):
+        """Process a single schedule and return embedding"""
         schedule_id = schedule["id"]
         
         # schedule_context: Full schedule information
@@ -377,7 +476,7 @@ def create_schedule_embeddings(user_id: str, schedules: list, start_progress: in
         
         try:
             schedule_vector = embed_text(schedule_text)
-            embeddings_to_insert.append({
+            embedding = {
                 "id": f"{schedule_id}_context",
                 "user_id": user_id,
                 "type": "schedule_context",
@@ -385,25 +484,35 @@ def create_schedule_embeddings(user_id: str, schedules: list, start_progress: in
                 "email_id": None,
                 "schedule_id": schedule_id,
                 "file_id": None
-            })
+            }
+            
+            # Update progress (thread-safe)
+            with progress_lock:
+                processed_count[0] += 1
+                current_progress = start_progress + int(processed_count[0] / total_schedules * progress_range)
+                if current_progress - last_update_progress[0] >= 1:
+                    update_user_status(user_id, "processing", "embedding_schedules", current_progress)
+                    last_update_progress[0] = current_progress
+            
+            return embedding
         except Exception as e:
             print(f"Error embedding schedule {schedule_id}: {e}")
-        
-        # Update progress if at least 1% increase
-        current_progress = start_progress + int((idx + 1) / total_schedules * progress_range)
-        if current_progress - last_update_progress >= 1:
-            update_user_status(user_id, "processing", "embedding_schedules", current_progress)
-            last_update_progress = current_progress
+            return None
     
-    # Batch insert all embeddings
+    # Process schedules in parallel
+    thread_pool = get_thread_pool_manager()
+    results = thread_pool.process_parallel(user_id, schedules, process_single_schedule)
+    
+    # Filter out None results and batch insert
+    embeddings_to_insert = [r for r in results if r is not None]
     if embeddings_to_insert:
         batch_insert_embeddings(embeddings_to_insert)
 
 
 def create_file_embeddings(user_id: str, files: list, credentials, start_progress: int, end_progress: int):
     """
-    Create embeddings for files (with file processing)
-    Updates progress granularly as each file is processed.
+    Create embeddings for files (with file processing) in parallel.
+    Updates progress granularly as files are processed.
     
     Args:
         user_id: User UUID
@@ -417,16 +526,21 @@ def create_file_embeddings(user_id: str, files: list, credentials, start_progres
     
     total_files = len(files)
     progress_range = end_progress - start_progress
-    embeddings_to_insert = []
-    last_update_progress = start_progress
     
-    for idx, file in enumerate(files):
+    # Thread-safe progress tracking
+    progress_lock = threading.Lock()
+    processed_count = [0]
+    last_update_progress = [start_progress]
+    
+    def process_single_file(file):
+        """Process a single file and return embedding"""
         file_id = file["id"]
         file_name = file.get("name", "unknown")
+        mime_type = file.get("mime_type")
         
         # Download and process file
         try:
-            file_content = download_file_content(credentials, file_id)
+            file_content = download_file_content(credentials, file_id, mime_type)
             if file_content:
                 # Process file to get summary
                 summary = process_file_by_type(file_name, file_content)
@@ -435,17 +549,24 @@ def create_file_embeddings(user_id: str, files: list, credentials, start_progres
                 update_file_summary(user_id, file_id, summary)
                 
                 # Create embedding with file metadata and summary
+                metadata = file.get('metadata', {})
                 file_text = (
-                    f"User has the following file in Google Drive:"
-                    f"File: {file_name}. "
-                    f"Type: {file.get('mime_type', 'unknown')}. "
-                    f"Path: {file.get('path', 'unknown')}. "
-                    f"Modified: {file.get('modified_time', 'unknown')}. "
+                    f"User has the following file in Google Drive:\n"
+                    f"File Name: {file_name}\n"
+                    f"Type: {file.get('mime_type', 'unknown')}\n"
+                    f"Path: {file.get('path', 'unknown')}\n"
+                    f"Size: {file.get('size', 'unknown')} bytes\n"
+                    f"Modified: {file.get('modified_time', 'unknown')}\n"
+                    f"Owner: {file.get('owner_name', 'unknown')} ({file.get('owner_email', 'unknown')})\n"
+                    f"Owned by me: {metadata.get('ownedByMe', 'unknown')}\n"
+                    f"Created: {metadata.get('createdTime', 'unknown')}\n"
+                    f"Last viewed by me: {metadata.get('viewedByMeTime', 'unknown')}\n"
+                    f"Web view link: {metadata.get('webViewLink', 'N/A')}\n"
                     f"File Summary: {summary}"
                 )
                 
                 file_vector = embed_text(file_text)
-                embeddings_to_insert.append({
+                embedding = {
                     "id": f"{file_id}_context",
                     "user_id": user_id,
                     "type": "file_context",
@@ -453,17 +574,27 @@ def create_file_embeddings(user_id: str, files: list, credentials, start_progres
                     "email_id": None,
                     "schedule_id": None,
                     "file_id": file_id
-                })
+                }
+                
+                # Update progress (thread-safe)
+                with progress_lock:
+                    processed_count[0] += 1
+                    current_progress = start_progress + int(processed_count[0] / total_files * progress_range)
+                    if current_progress - last_update_progress[0] >= 1:
+                        update_user_status(user_id, "processing", "embedding_files", current_progress)
+                        last_update_progress[0] = current_progress
+                
+                return embedding
         except Exception as e:
             print(f"Error processing/embedding file {file_id}: {e}")
-        
-        # Update progress if at least 1% increase
-        current_progress = start_progress + int((idx + 1) / total_files * progress_range)
-        if current_progress - last_update_progress >= 1:
-            update_user_status(user_id, "processing", "embedding_files", current_progress)
-            last_update_progress = current_progress
+            return None
     
-    # Batch insert all embeddings
+    # Process files in parallel
+    thread_pool = get_thread_pool_manager()
+    results = thread_pool.process_parallel(user_id, files, process_single_file)
+    
+    # Filter out None results and batch insert
+    embeddings_to_insert = [r for r in results if r is not None]
     if embeddings_to_insert:
         batch_insert_embeddings(embeddings_to_insert)
 
@@ -472,7 +603,7 @@ def create_file_embeddings(user_id: str, files: list, credentials, start_progres
 # Main Initialization Function
 # ======================================================
 
-async def initialize_user_data(user_id: str, credentials, progress_callback=None):
+async def initialize_user_data(user_id: str, credentials, progress_callback=None, debug_mode=False):
     """
     Initialize user data: fetch emails, schedules, files, and create embeddings.
     
@@ -480,6 +611,7 @@ async def initialize_user_data(user_id: str, credentials, progress_callback=None
         user_id: User UUID
         credentials: Google OAuth credentials
         progress_callback: Optional callback function to update progress
+        debug_mode: If True, only processes the latest 50 files to save API costs
     
     Returns:
         dict: Summary of initialization results
@@ -530,7 +662,7 @@ async def initialize_user_data(user_id: str, credentials, progress_callback=None
         if progress_callback:
             progress_callback("fetching_files", 50)
         
-        files = fetch_drive_all_files(credentials)
+        files = fetch_drive_all_files(credentials, debug_mode=debug_mode)
         inserted_files = insert_files(user_id, files)
         results["files_count"] = len(inserted_files)
         

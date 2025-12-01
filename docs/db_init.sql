@@ -78,6 +78,7 @@ create table if not exists files (
   modified_time timestamptz,
   parents text[], -- NEW: Drive folder IDs (real structure, stable)
   summary text,
+  metadata jsonb, -- Additional metadata from Google Drive API
   primary key (id, user_id)
 );
 
