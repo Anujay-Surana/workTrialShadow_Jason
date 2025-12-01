@@ -13,14 +13,14 @@ def vector_search(user_id: str, query_embedding: List[float], search_types: List
     Args:
         user_id: User UUID
         query_embedding: Query embedding vector
-        search_types: List of types to search ('email_context', 'schedule_context', 'file_context')
+        search_types: List of types to search ('email_context', 'schedule_context', 'file_context', 'attachment_context')
         top_k: Number of results per type
     
     Returns:
         List of search results with scores
     """
     if search_types is None:
-        search_types = ['email_context', 'schedule_context', 'file_context']
+        search_types = ['email_context', 'schedule_context', 'file_context', 'attachment_context']
     
     results = []
     
@@ -88,6 +88,27 @@ def vector_search(user_id: str, query_embedding: List[float], search_types: List
                         'score': item['similarity'],
                         'source': 'vector'
                     })
+            
+            elif 'attachment' in search_type:
+                response = supabase.rpc(
+                    'match_attachment_embeddings',
+                    {
+                        '_user_id': user_id,
+                        '_query_embedding': query_embedding,
+                        '_type': search_type,
+                        '_match_threshold': 0.2,
+                        '_match_count': top_k
+                    }
+                ).execute()
+                
+                for item in response.data:
+                    results.append({
+                        'type': 'attachment',
+                        'id': item['attachment_id'],
+                        'embedding_type': item['type'],
+                        'score': item['similarity'],
+                        'source': 'vector'
+                    })
         
         except Exception as e:
             print(f"Error in vector search for {search_type}: {e}")
@@ -97,7 +118,7 @@ def vector_search(user_id: str, query_embedding: List[float], search_types: List
 
 def keyword_search(user_id: str, keywords: List[str], top_k: int = 10) -> List[Dict]:
     """
-    Perform keyword search across emails, schedules, and files.
+    Perform keyword search across emails, schedules, files, and attachments.
     
     Args:
         user_id: User UUID
@@ -231,6 +252,46 @@ def keyword_search(user_id: str, keywords: List[str], top_k: int = 10) -> List[D
                 })
     except Exception as e:
         print(f"Error in keyword search for files: {e}")
+    
+    # Search attachments
+    try:
+        for keyword in keywords:
+            # Search in filename
+            response = supabase.table('attachments').select('id, filename, summary').eq('user_id', user_id).filter(
+                'filename', 'ilike', f'%{keyword}%'
+            ).limit(top_k).execute()
+            
+            # Also search in summary
+            response2 = supabase.table('attachments').select('id, filename, summary').eq('user_id', user_id).filter(
+                'summary', 'ilike', f'%{keyword}%'
+            ).limit(top_k).execute()
+            
+            # Combine and deduplicate
+            combined_data = response.data + response2.data
+            seen_ids = set()
+            unique_data = []
+            for item in combined_data:
+                if item['id'] not in seen_ids:
+                    seen_ids.add(item['id'])
+                    unique_data.append(item)
+            
+            response.data = unique_data[:top_k]
+            
+            for item in response.data:
+                score = 0.0
+                if keyword.lower() in (item.get('filename', '') or '').lower():
+                    score += 0.5
+                if keyword.lower() in (item.get('summary', '') or '').lower():
+                    score += 0.3
+                
+                results.append({
+                    'type': 'attachment',
+                    'id': item['id'],
+                    'score': score,
+                    'source': 'keyword'
+                })
+    except Exception as e:
+        print(f"Error in keyword search for attachments: {e}")
     
     return results
 
@@ -440,6 +501,58 @@ def get_context_from_results(user_id: str, search_results: List[Dict]) -> Tuple[
                         'path': file.get('path', 'unknown'),
                         'mime_type': file.get('mime_type', 'unknown')
                     })
+            
+            elif result_type == 'attachment':
+                response = supabase.table('attachments').select('*').eq('user_id', user_id).eq('id', result_id).execute()
+                if response.data:
+                    attachment = response.data[0]
+                    email_id = attachment.get('email_id', 'unknown')
+                    
+                    # Get email information for context
+                    email_info = None
+                    try:
+                        email_response = supabase.table('emails').select('*').eq('user_id', user_id).eq('id', email_id).execute()
+                        if email_response.data:
+                            email_info = email_response.data[0]
+                    except Exception as e:
+                        print(f"Error fetching email info for attachment {result_id}: {e}")
+                    
+                    # Build context with email information
+                    context_text = f"[Email Attachment] {attachment.get('filename', 'unknown')}\n"
+                    context_text += f"Type: {attachment.get('mime_type', 'unknown')}\n"
+                    context_text += f"Size: {attachment.get('size', 'unknown')} bytes\n"
+                    
+                    if email_info:
+                        context_text += f"From email sent by: {email_info.get('from_user', 'unknown')}\n"
+                        context_text += f"To: {email_info.get('to_user', 'unknown')}\n"
+                        if email_info.get('cc'):
+                            context_text += f"CC: {email_info.get('cc')}\n"
+                        if email_info.get('bcc'):
+                            context_text += f"BCC: {email_info.get('bcc')}\n"
+                        context_text += f"Email date: {email_info.get('date', 'unknown')}\n"
+                        context_text += f"Email subject: {email_info.get('subject', 'No subject')}\n"
+                    
+                    context_text += f"Summary: {attachment.get('summary', 'No summary available')}\n"
+                    context_parts.append(context_text)
+                    
+                    # Build reference with email information
+                    ref = {
+                        'type': 'attachment',
+                        'id': result_id,
+                        'title': attachment.get('filename', 'unknown'),
+                        'mime_type': attachment.get('mime_type', 'unknown'),
+                        'email_id': email_id
+                    }
+                    
+                    if email_info:
+                        ref['from'] = email_info.get('from_user', 'unknown')
+                        ref['to'] = email_info.get('to_user', 'unknown')
+                        ref['cc'] = email_info.get('cc', '')
+                        ref['bcc'] = email_info.get('bcc', '')
+                        ref['date'] = email_info.get('date', 'unknown')
+                        ref['subject'] = email_info.get('subject', 'No subject')
+                    
+                    references.append(ref)
         
         except Exception as e:
             print(f"Error fetching {result_type} {result_id}: {e}")

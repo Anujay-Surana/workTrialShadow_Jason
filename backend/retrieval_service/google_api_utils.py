@@ -4,12 +4,14 @@ import threading
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from email.utils import parsedate_to_datetime
-from retrieval_service.openai_api_utils import summarize_doc
+from retrieval_service.openai_api_utils import summarize_doc, summarize
 from retrieval_service.supabase_utils import (
     get_emails_by_thread,
+    get_attachments_by_email,
     insert_embedding,
     batch_insert_embeddings,
     update_file_summary,
+    update_attachment_summary,
     update_user_status
 )
 from retrieval_service.gemni_api_utils import embed_text
@@ -26,6 +28,7 @@ from retrieval_service.doc_utils import extractDOC, isDOC
 async def fetch_gmail_messages(credentials, query="(category:primary OR label:sent) newer_than:90d", sleep_time=0.5, max_per_page=500):
     service = build("gmail", "v1", credentials=credentials)
     all_emails = []
+    all_attachments = []
     next_page_token = None
 
     while True:
@@ -56,8 +59,10 @@ async def fetch_gmail_messages(credentials, query="(category:primary OR label:se
             except Exception:
                 iso_date = None
 
+            email_id = msg.get("id")
+            
             all_emails.append({
-                "id": msg.get("id"),
+                "id": email_id,
                 "thread_id": msg.get("threadId"),
                 "snippet": msg.get("snippet", ""),
                 "subject": get_header("Subject"),
@@ -67,6 +72,10 @@ async def fetch_gmail_messages(credentials, query="(category:primary OR label:se
                 "bcc": get_header("Bcc"),
                 "date": iso_date,  # <-- FIXED
             })
+            
+            # Extract attachments
+            attachments = extract_attachments(msg, email_id)
+            all_attachments.extend(attachments)
 
         next_page_token = response.get("nextPageToken")
         if not next_page_token:
@@ -74,7 +83,39 @@ async def fetch_gmail_messages(credentials, query="(category:primary OR label:se
 
         time.sleep(sleep_time)
 
-    return all_emails
+    return all_emails, all_attachments
+
+
+def extract_attachments(message, email_id):
+    """Extract attachment metadata from a Gmail message"""
+    attachments = []
+    
+    def process_parts(parts, email_id):
+        """Recursively process message parts to find attachments"""
+        for part in parts:
+            # Check if this part has nested parts
+            if 'parts' in part:
+                process_parts(part['parts'], email_id)
+            
+            # Check if this is an attachment
+            filename = part.get('filename', '')
+            if filename:
+                attachment_id = part.get('body', {}).get('attachmentId')
+                if attachment_id:
+                    attachments.append({
+                        'id': attachment_id,
+                        'email_id': email_id,
+                        'filename': filename,
+                        'mime_type': part.get('mimeType', ''),
+                        'size': part.get('body', {}).get('size', 0)
+                    })
+    
+    # Process message payload
+    payload = message.get('payload', {})
+    if 'parts' in payload:
+        process_parts(payload['parts'], email_id)
+    
+    return attachments
 
 
 # ======================================================
@@ -281,10 +322,27 @@ def download_file_content(credentials, file_id, mime_type=None):
         return None
 
 
+def download_attachment_content(credentials, message_id, attachment_id):
+    """Download attachment content from Gmail"""
+    try:
+        service = build("gmail", "v1", credentials=credentials)
+        attachment = service.users().messages().attachments().get(
+            userId="me",
+            messageId=message_id,
+            id=attachment_id
+        ).execute()
+        
+        import base64
+        file_data = base64.urlsafe_b64decode(attachment['data'])
+        return file_data
+    except Exception as e:
+        print(f"Error downloading attachment {attachment_id}: {e}")
+        return None
+
+
 def process_file_by_type(file_name: str, file_content: bytes) -> str:
     """
-    Placeholder function to process file content and return summary.
-    Will be implemented later with actual file processing logic.
+    Process file content and return summary.
     
     Args:
         file_name: Name of the file
@@ -296,9 +354,9 @@ def process_file_by_type(file_name: str, file_content: bytes) -> str:
     if isIMG(file_name):
         try:
             text = extractOCR(file_content)
-            return "A image with following extracted text:" + text if text else "A image file with no extractable text."
+            return "An image with following extracted text: " + text if text else "An image file with no extractable text."
         except Exception as e:
-            return "A image file with no extractable text."
+            return "An image file with no extractable text."
     if isDOC(file_name):
         try:
             text = extractDOC(file_content, filename=file_name)
@@ -320,7 +378,7 @@ def create_email_embeddings(user_id: str, emails: list, start_progress: int, end
     
     Args:
         user_id: User UUID
-        emails: List of email dictionaries
+        emails: List of email dictionaries from database
         start_progress: Starting progress percentage
         end_progress: Ending progress percentage
     """
@@ -342,13 +400,23 @@ def create_email_embeddings(user_id: str, emails: list, start_progress: int, end
         email_id = email["id"]
         email_embeddings = []
         
-        # 1. email_sum: Full email information
+        # Get attachments for this email
+        attachments = get_attachments_by_email(user_id, email_id)
+        attachment_info = ""
+        if attachments:
+            attachment_info = "\nAttachments:\n"
+            for att in attachments:
+                att_summary = att.get('summary', 'No summary')
+                attachment_info += f"- {att.get('filename', 'unknown')}: {att_summary}\n"
+        
+        # 1. email_sum: Full email information including attachments
         email_sum_text = (
             f"An email from {email.get('from_user', 'unknown')} "
             f"to {email.get('to_user', 'unknown')} "
             f"at {email.get('date', 'unknown date')}. "
             f"Subject: {email.get('subject', 'No subject')}. "
             f"Content: {email.get('body', '')}"
+            f"{attachment_info}"
         )
         try:
             email_sum_vector = embed_text(email_sum_text)
@@ -359,24 +427,40 @@ def create_email_embeddings(user_id: str, emails: list, start_progress: int, end
                 "vector": email_sum_vector,
                 "email_id": email_id,
                 "schedule_id": None,
-                "file_id": None
+                "file_id": None,
+                "attachment_id": None
             })
         except Exception as e:
             print(f"Error embedding email_sum for {email_id}: {e}")
         
-        # 2. email_context: Full thread context
+        # 2. email_context: Full thread context with summarization
         thread_id = email.get("thread_id")
         if thread_id:
             try:
                 thread_emails = get_emails_by_thread(user_id, thread_id)
                 thread_text = "Email thread:\n"
                 for t_email in thread_emails:
+                    # Get attachments for thread email
+                    t_attachments = get_attachments_by_email(user_id, t_email["id"])
+                    t_att_info = ""
+                    if t_attachments:
+                        t_att_info = " [Attachments: "
+                        t_att_info += ", ".join([att.get('filename', 'unknown') for att in t_attachments])
+                        t_att_info += "]"
+                    
                     thread_text += (
                         f"From {t_email.get('from_user', 'unknown')} "
                         f"at {t_email.get('date', 'unknown')}: "
                         f"{t_email.get('subject', 'No subject')} - "
-                        f"{t_email.get('body', '')}\n"
+                        f"{t_email.get('body', '')}"
+                        f"{t_att_info}\n"
                     )
+                
+                # Summarize thread if it's too long (> 8000 chars)
+                if len(thread_text) > 8000:
+                    print(f"[INFO] Thread {thread_id} is long ({len(thread_text)} chars), summarizing...")
+                    thread_summary = summarize(thread_text, max_chars=8000)
+                    thread_text = f"Email thread summary:\n{thread_summary}"
                 
                 email_context_vector = embed_text(thread_text)
                 email_embeddings.append({
@@ -386,17 +470,18 @@ def create_email_embeddings(user_id: str, emails: list, start_progress: int, end
                     "vector": email_context_vector,
                     "email_id": email_id,
                     "schedule_id": None,
-                    "file_id": None
+                    "file_id": None,
+                    "attachment_id": None
                 })
             except Exception as e:
                 print(f"Error embedding email_context for {email_id}: {e}")
         
-        # 3. email_title: Subject and sender/receiver info
+        # 3. email_title: Subject and sender/receiver info only (no attachments)
         email_title_text = (
             f"An Email with subject: {email.get('subject', 'No subject')}. "
             f"From: {email.get('from_user', 'unknown')}. "
-            f"To: {email.get('to_user', 'unknown')}."
-            f"CC: {email.get('cc', 'none')}."
+            f"To: {email.get('to_user', 'unknown')}. "
+            f"CC: {email.get('cc', 'none')}. "
             f"BCC: {email.get('bcc', 'none')}."
         )
         try:
@@ -408,7 +493,8 @@ def create_email_embeddings(user_id: str, emails: list, start_progress: int, end
                 "vector": email_title_vector,
                 "email_id": email_id,
                 "schedule_id": None,
-                "file_id": None
+                "file_id": None,
+                "attachment_id": None
             })
         except Exception as e:
             print(f"Error embedding email_title for {email_id}: {e}")
@@ -573,7 +659,8 @@ def create_file_embeddings(user_id: str, files: list, credentials, start_progres
                     "vector": file_vector,
                     "email_id": None,
                     "schedule_id": None,
-                    "file_id": file_id
+                    "file_id": file_id,
+                    "attachment_id": None
                 }
                 
                 # Update progress (thread-safe)
@@ -599,13 +686,116 @@ def create_file_embeddings(user_id: str, files: list, credentials, start_progres
         batch_insert_embeddings(embeddings_to_insert)
 
 
+def create_attachment_embeddings(user_id: str, attachments: list, credentials, start_progress: int, end_progress: int):
+    """
+    Create embeddings for email attachments (with file processing) in parallel.
+    Updates progress granularly as attachments are processed.
+    
+    Args:
+        user_id: User UUID
+        attachments: List of attachment dictionaries from database
+        credentials: Google credentials for downloading attachments
+        start_progress: Starting progress percentage
+        end_progress: Ending progress percentage
+    """
+    if not attachments:
+        return
+    
+    total_attachments = len(attachments)
+    progress_range = end_progress - start_progress
+    
+    # Thread-safe progress tracking
+    progress_lock = threading.Lock()
+    processed_count = [0]
+    last_update_progress = [start_progress]
+    
+    def process_single_attachment(attachment):
+        """Process a single attachment and return embedding"""
+        attachment_id = attachment["id"]
+        email_id = attachment["email_id"]
+        filename = attachment.get("filename", "unknown")
+        
+        # Get email information for context
+        from retrieval_service.supabase_utils import supabase
+        email_info = None
+        try:
+            email_response = supabase.table('emails').select('*').eq('user_id', user_id).eq('id', email_id).execute()
+            if email_response.data:
+                email_info = email_response.data[0]
+        except Exception as e:
+            print(f"Error fetching email info for attachment {attachment_id}: {e}")
+        
+        # Download and process attachment
+        try:
+            att_content = download_attachment_content(credentials, email_id, attachment_id)
+            if att_content:
+                # Process attachment to get summary
+                summary = process_file_by_type(filename, att_content)
+                
+                # Update attachment summary in database
+                update_attachment_summary(user_id, attachment_id, summary)
+                
+                # Create embedding with attachment metadata, email context, and summary
+                att_text = f"Email attachment:\nFilename: {filename}\n"
+                att_text += f"Type: {attachment.get('mime_type', 'unknown')}\n"
+                att_text += f"Size: {attachment.get('size', 'unknown')} bytes\n"
+                
+                # Add email context
+                if email_info:
+                    att_text += f"From email sent by: {email_info.get('from_user', 'unknown')}\n"
+                    att_text += f"To: {email_info.get('to_user', 'unknown')}\n"
+                    if email_info.get('cc'):
+                        att_text += f"CC: {email_info.get('cc')}\n"
+                    if email_info.get('bcc'):
+                        att_text += f"BCC: {email_info.get('bcc')}\n"
+                    att_text += f"Email date: {email_info.get('date', 'unknown')}\n"
+                    att_text += f"Email subject: {email_info.get('subject', 'No subject')}\n"
+                    att_text += f"Email summary: {email_info.get('body', '')[:500]}\n"
+                
+                att_text += f"Attachment Summary: {summary}"
+                
+                att_vector = embed_text(att_text)
+                embedding = {
+                    "id": f"{attachment_id}_context",
+                    "user_id": user_id,
+                    "type": "attachment_context",
+                    "vector": att_vector,
+                    "email_id": None,
+                    "schedule_id": None,
+                    "file_id": None,
+                    "attachment_id": attachment_id
+                }
+                
+                # Update progress (thread-safe)
+                with progress_lock:
+                    processed_count[0] += 1
+                    current_progress = start_progress + int(processed_count[0] / total_attachments * progress_range)
+                    if current_progress - last_update_progress[0] >= 1:
+                        update_user_status(user_id, "processing", "embedding_attachments", current_progress)
+                        last_update_progress[0] = current_progress
+                
+                return embedding
+        except Exception as e:
+            print(f"Error processing/embedding attachment {attachment_id}: {e}")
+            return None
+    
+    # Process attachments in parallel
+    thread_pool = get_thread_pool_manager()
+    results = thread_pool.process_parallel(user_id, attachments, process_single_attachment)
+    
+    # Filter out None results and batch insert
+    embeddings_to_insert = [r for r in results if r is not None]
+    if embeddings_to_insert:
+        batch_insert_embeddings(embeddings_to_insert)
+
+
 # ======================================================
 # Main Initialization Function
 # ======================================================
 
 async def initialize_user_data(user_id: str, credentials, progress_callback=None, debug_mode=False):
     """
-    Initialize user data: fetch emails, schedules, files, and create embeddings.
+    Initialize user data: fetch emails, schedules, files, attachments and create embeddings.
     
     Args:
         user_id: User UUID
@@ -616,12 +806,13 @@ async def initialize_user_data(user_id: str, credentials, progress_callback=None
     Returns:
         dict: Summary of initialization results
     """
-    from retrieval_service.supabase_utils import insert_emails, insert_schedules, insert_files
+    from retrieval_service.supabase_utils import insert_emails, insert_schedules, insert_files, insert_attachments
     
     results = {
         "emails_count": 0,
         "schedules_count": 0,
         "files_count": 0,
+        "attachments_count": 0,
         "error": None
     }
     
@@ -631,55 +822,60 @@ async def initialize_user_data(user_id: str, credentials, progress_callback=None
         if progress_callback:
             progress_callback("starting", 0)
         
-        # Step 1: Fetch and insert emails (33% progress)
+        # Step 1: Fetch and insert emails and attachments
         update_user_status(user_id, "processing", "fetching_emails", 10)
         if progress_callback:
             progress_callback("fetching_emails", 10)
         
-        emails = await fetch_gmail_messages(credentials)
+        emails, attachments = await fetch_gmail_messages(credentials)
         inserted_emails = insert_emails(user_id, emails)
+        inserted_attachments = insert_attachments(user_id, attachments)
         results["emails_count"] = len(inserted_emails)
+        results["attachments_count"] = len(inserted_attachments)
         
         update_user_status(user_id, "processing", "emails_fetched", 20)
         if progress_callback:
             progress_callback("emails_fetched", 20)
         
-        # Step 2: Fetch and insert schedules (33% progress)
-        update_user_status(user_id, "processing", "fetching_schedules", 30)
+        # Step 2: Fetch and insert schedules
+        update_user_status(user_id, "processing", "fetching_schedules", 25)
         if progress_callback:
-            progress_callback("fetching_schedules", 30)
+            progress_callback("fetching_schedules", 25)
         
         schedules = fetch_calendar_events(credentials)
         inserted_schedules = insert_schedules(user_id, schedules)
         results["schedules_count"] = len(inserted_schedules)
         
-        update_user_status(user_id, "processing", "schedules_fetched", 40)
+        update_user_status(user_id, "processing", "schedules_fetched", 30)
         if progress_callback:
-            progress_callback("schedules_fetched", 40)
+            progress_callback("schedules_fetched", 30)
         
-        # Step 3: Fetch and insert files (34% progress)
-        update_user_status(user_id, "processing", "fetching_files", 50)
+        # Step 3: Fetch and insert files
+        update_user_status(user_id, "processing", "fetching_files", 35)
         if progress_callback:
-            progress_callback("fetching_files", 50)
+            progress_callback("fetching_files", 35)
         
         files = fetch_drive_all_files(credentials, debug_mode=debug_mode)
         inserted_files = insert_files(user_id, files)
         results["files_count"] = len(inserted_files)
         
-        update_user_status(user_id, "processing", "files_fetched", 60)
+        update_user_status(user_id, "processing", "files_fetched", 40)
         if progress_callback:
-            progress_callback("files_fetched", 60)
+            progress_callback("files_fetched", 40)
         
-        # Step 4: Create embeddings for emails (60-75%)
-        create_email_embeddings(user_id, inserted_emails, 60, 75)
+        # Step 4: Create embeddings for attachments (40-55%)
+        create_attachment_embeddings(user_id, inserted_attachments, credentials, 40, 55)
         
-        # Step 5: Create embeddings for schedules (75-85%)
-        create_schedule_embeddings(user_id, inserted_schedules, 75, 85)
+        # Step 5: Create embeddings for emails (55-70%)
+        create_email_embeddings(user_id, inserted_emails, 55, 70)
         
-        # Step 6: Create embeddings for files (85-100%)
-        create_file_embeddings(user_id, inserted_files, credentials, 85, 100)
+        # Step 6: Create embeddings for schedules (70-80%)
+        create_schedule_embeddings(user_id, inserted_schedules, 70, 80)
         
-        # Step 7: Complete
+        # Step 7: Create embeddings for files (80-100%)
+        create_file_embeddings(user_id, inserted_files, credentials, 80, 100)
+        
+        # Step 8: Complete
         update_user_status(user_id, "active", "completed", 100)
         if progress_callback:
             progress_callback("completed", 100)

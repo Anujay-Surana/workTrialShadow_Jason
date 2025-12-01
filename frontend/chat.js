@@ -94,6 +94,19 @@ function addMessage(role, content, references = null) {
                 refText = `[Calendar] ${ref.title} (${ref.start_time}, ${ref.location})`;
             } else if (ref.type === 'file') {
                 refText = `[File] ${ref.title} (${ref.path})`;
+            } else if (ref.type === 'attachment') {
+                let attachmentText = `[Attachment] ${ref.title}`;
+                if (ref.subject) {
+                    attachmentText += ` from email: "${ref.subject}"`;
+                }
+                if (ref.from) {
+                    attachmentText += ` (from ${ref.from}`;
+                    if (ref.date) {
+                        attachmentText += `, ${ref.date}`;
+                    }
+                    attachmentText += ')';
+                }
+                refText = attachmentText;
             }
             
             refItem.innerHTML = `<span class="reference-type">${ref.type}</span>: ${refText}`;
@@ -242,6 +255,18 @@ async function sendMessage() {
                                         refText = `${ref.title} (${ref.start_time}, ${ref.location})`;
                                     } else if (ref.type === 'file') {
                                         refText = `${ref.title} (${ref.path})`;
+                                    } else if (ref.type === 'attachment') {
+                                        refText = `${ref.title}`;
+                                        if (ref.subject) {
+                                            refText += ` from email: "${ref.subject}"`;
+                                        }
+                                        if (ref.from) {
+                                            refText += ` (from ${ref.from}`;
+                                            if (ref.date) {
+                                                refText += `, ${ref.date}`;
+                                            }
+                                            refText += ')';
+                                        }
                                     }
                                     
                                     refItem.innerHTML = `<span class="reference-type">[${ref.type}]</span> ${refText}`;

@@ -199,11 +199,62 @@ def update_file_summary(user_id: str, file_id: str, summary: str):
 
 
 # ======================================================
+# Attachment Management
+# ======================================================
+
+def insert_attachments(user_id: str, attachments: list):
+    """Batch insert attachments for a user"""
+    try:
+        if not attachments:
+            return []
+        
+        # Prepare attachment records
+        records = []
+        for attachment in attachments:
+            records.append({
+                "id": attachment["id"],
+                "user_id": user_id,
+                "email_id": attachment["email_id"],
+                "filename": attachment.get("filename"),
+                "mime_type": attachment.get("mime_type"),
+                "size": attachment.get("size"),
+                "summary": None  # Will be filled during processing
+            })
+        
+        # Batch insert with upsert
+        response = supabase.table("attachments").upsert(records).execute()
+        return response.data
+    except Exception as e:
+        print(f"Error inserting attachments: {e}")
+        return []
+
+
+def update_attachment_summary(user_id: str, attachment_id: str, summary: str):
+    """Update attachment summary after processing"""
+    try:
+        response = supabase.table("attachments").update({"summary": summary}).eq("user_id", user_id).eq("id", attachment_id).execute()
+        return response.data[0] if response.data else None
+    except Exception as e:
+        print(f"Error updating attachment summary: {e}")
+        return None
+
+
+def get_attachments_by_email(user_id: str, email_id: str):
+    """Get all attachments for an email"""
+    try:
+        response = supabase.table("attachments").select("*").eq("user_id", user_id).eq("email_id", email_id).execute()
+        return response.data
+    except Exception as e:
+        print(f"Error getting attachments by email: {e}")
+        return []
+
+
+# ======================================================
 # Embedding Management
 # ======================================================
 
 def insert_embedding(user_id: str, embedding_id: str, embedding_type: str, vector: list, 
-                     email_id: str = None, schedule_id: str = None, file_id: str = None):
+                     email_id: str = None, schedule_id: str = None, file_id: str = None, attachment_id: str = None):
     """Insert a single embedding"""
     try:
         record = {
@@ -213,7 +264,8 @@ def insert_embedding(user_id: str, embedding_id: str, embedding_type: str, vecto
             "vector": vector,
             "email_id": email_id,
             "schedule_id": schedule_id,
-            "file_id": file_id
+            "file_id": file_id,
+            "attachment_id": attachment_id
         }
         
         response = supabase.table("embeddings").upsert(record).execute()

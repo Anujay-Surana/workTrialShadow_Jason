@@ -87,6 +87,23 @@ create index IF not exists files_user_modified_idx on files (user_id, modified_t
 create index IF not exists files_user_parents_idx on files using GIN (parents);
 
 -- ======================================================
+-- attachments table
+-- ======================================================
+create table if not exists attachments (
+  id text not null,
+  user_id uuid not null references users (uuid) on delete CASCADE,
+  email_id text not null,
+  filename text,
+  mime_type text,
+  size bigint,
+  summary text,
+  primary key (id, user_id),
+  foreign KEY (user_id, email_id) references emails (user_id, id) on delete CASCADE
+);
+
+create index IF not exists attachments_user_email_idx on attachments (user_id, email_id);
+
+-- ======================================================
 -- embeddings table
 -- ======================================================
 create table if not exists embeddings (
@@ -98,10 +115,12 @@ create table if not exists embeddings (
   email_id text,
   schedule_id text,
   file_id text,
+  attachment_id text,
   primary key (id, user_id, type),
   foreign KEY (user_id, email_id) references emails (user_id, id) on delete CASCADE,
   foreign KEY (user_id, schedule_id) references schedules (user_id, id) on delete CASCADE,
-  foreign KEY (user_id, file_id) references files (user_id, id) on delete CASCADE
+  foreign KEY (user_id, file_id) references files (user_id, id) on delete CASCADE,
+  foreign KEY (user_id, attachment_id) references attachments (user_id, id) on delete CASCADE
 );
 
 create index IF not exists embeddings_user_type_idx on embeddings (user_id, type);
@@ -113,6 +132,8 @@ create index IF not exists embeddings_email_fk_idx on embeddings (user_id, email
 create index IF not exists embeddings_schedule_fk_idx on embeddings (user_id, schedule_id);
 
 create index IF not exists embeddings_file_fk_idx on embeddings (user_id, file_id);
+
+create index IF not exists embeddings_attachment_fk_idx on embeddings (user_id, attachment_id);
 
 create index IF not exists embeddings_vector_hnsw_idx on embeddings using hnsw (vector vector_cosine_ops);
 
@@ -163,6 +184,25 @@ create or replace function public.match_file_embeddings (
 ) returns table (file_id text, type text, similarity float4) language sql stable as $$
   select
     e.file_id,
+    e.type,
+    1 - (e.vector <=> _query_embedding) as similarity
+  from public.embeddings e
+  where e.user_id = _user_id
+    and e.type = _type
+    and 1 - (e.vector <=> _query_embedding) >= _match_threshold
+  order by e.vector <=> _query_embedding
+  limit _match_count;
+$$;
+
+create or replace function public.match_attachment_embeddings (
+  _user_id uuid,
+  _query_embedding vector (1536),
+  _type text default 'attachment_context',
+  _match_threshold float4 default 0.2,
+  _match_count int default 10
+) returns table (attachment_id text, type text, similarity float4) language sql stable as $$
+  select
+    e.attachment_id,
     e.type,
     1 - (e.vector <=> _query_embedding) as similarity
   from public.embeddings e

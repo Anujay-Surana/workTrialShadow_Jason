@@ -115,6 +115,7 @@ function updateInitializationProgress(data) {
             'schedules_fetched': 'Calendar events fetched successfully',
             'fetching_files': 'Fetching your drive files...',
             'files_fetched': 'Files fetched successfully',
+            'embedding_attachments': 'Processing attachments...',
             'embedding_emails': 'Processing emails...',
             'emails_embedded': 'Emails processed successfully',
             'embedding_schedules': 'Processing calendar events...',
