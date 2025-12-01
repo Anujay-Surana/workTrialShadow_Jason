@@ -45,7 +45,12 @@ Simple Google OAuth authentication service with a FastAPI backend and a vanilla 
    MAX_WORKERS_PER_USER=5
    MAX_TOTAL_WORKERS=20
    DEBUG_MODE=true
+   
+   # Search Configuration
+   SEARCH_TOP_K=5
    ```
+   
+   **SEARCH_TOP_K**: Number of top results to return from combined search (default: 5)
 
 6. Run backend:
 

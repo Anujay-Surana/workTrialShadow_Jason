@@ -4,6 +4,13 @@ Search utilities combining vector search, keyword search, and fuzzy search
 from retrieval_service.supabase_utils import supabase
 from retrieval_service.gemni_api_utils import embed_text
 from typing import List, Dict, Tuple
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Get top-k from environment variable, default to 5
+DEFAULT_TOP_K = int(os.getenv("SEARCH_TOP_K", "5"))
 
 
 def vector_search(user_id: str, query_embedding: List[float], search_types: List[str] = None, top_k: int = 10) -> List[Dict]:
@@ -365,7 +372,7 @@ def fuzzy_search(user_id: str, query: str, top_k: int = 10) -> List[Dict]:
 
 def combined_search(user_id: str, query: str, keywords: List[str] = None, 
                    vector_weight: float = 0.6, keyword_weight: float = 0.3, 
-                   fuzzy_weight: float = 0.1, top_k: int = 10) -> List[Dict]:
+                   fuzzy_weight: float = 0.1, top_k: int = None) -> List[Dict]:
     """
     Perform combined search using vector, keyword, and fuzzy search.
     
@@ -376,11 +383,15 @@ def combined_search(user_id: str, query: str, keywords: List[str] = None,
         vector_weight: Weight for vector search results
         keyword_weight: Weight for keyword search results
         fuzzy_weight: Weight for fuzzy search results
-        top_k: Number of final results to return
+        top_k: Number of final results to return (uses DEFAULT_TOP_K from env if None)
     
     Returns:
         List of top-k search results with references
     """
+    # Use default top_k from environment if not provided
+    if top_k is None:
+        top_k = DEFAULT_TOP_K
+    
     # Generate embedding for vector search
     query_embedding = embed_text(query)
     

@@ -402,13 +402,13 @@ async def chat(request: Request):
                 pass
         
         # Perform combined search (vector only, not keyword/fuzzy for chat)
+        # top_k is controlled by SEARCH_TOP_K environment variable
         search_results = combined_search(
             user_id=user_id,
             query=search_query,
             vector_weight=1.0,
             keyword_weight=0.0,
-            fuzzy_weight=0.0,
-            top_k=5
+            fuzzy_weight=0.0
         )
         
         # Get context and references from search results
