@@ -9,8 +9,21 @@ from dotenv import load_dotenv
 import json
 import requests
 from datetime import datetime, timedelta
+import threading
+import asyncio
+
+from retrieval_service.google_api_utils import initialize_user_data
+from retrieval_service.supabase_utils import get_user_by_email, create_user, update_user_status
+from retrieval_service.search_utils import combined_search, get_context_from_results
+from retrieval_service.openai_api_utils import chat_stream, summarize
+from fastapi.responses import StreamingResponse
+import json
+from retrieval_service.ocr_utils import init_model
 
 load_dotenv()
+print("Loading OCR model...")
+init_model(['en'])
+print("OCR model loaded.")
 
 app = FastAPI()
 
@@ -39,7 +52,6 @@ SCOPES = [
     "https://www.googleapis.com/auth/calendar.readonly",
     "https://www.googleapis.com/auth/drive.readonly",
     "https://www.googleapis.com/auth/gmail.readonly",
-
 ]
 
 # OAuth flow configuration
@@ -78,6 +90,20 @@ async def google_auth():
     return response
 
 
+def run_initialization_in_background(user_id: str, credentials):
+    """Run initialization in a background thread"""
+    def run_async_init():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(initialize_user_data(user_id, credentials))
+        finally:
+            loop.close()
+    
+    thread = threading.Thread(target=run_async_init, daemon=True)
+    thread.start()
+
+
 @app.get("/auth/google/callback")
 async def google_callback(request: Request, code: str = None, state: str = None):
     """Handle Google OAuth callback"""
@@ -92,8 +118,6 @@ async def google_callback(request: Request, code: str = None, state: str = None)
             )
 
         # Manually fetch token to avoid scope validation issues
-        # The flow.fetch_token() method validates scopes strictly and raises errors
-        # when Google returns additional previously-granted scopes
         try:
             token_url = "https://oauth2.googleapis.com/token"
             token_data = {
@@ -105,7 +129,6 @@ async def google_callback(request: Request, code: str = None, state: str = None)
             }
             token_response = requests.post(token_url, data=token_data)
             
-            # Check for errors and provide detailed error message
             if token_response.status_code != 200:
                 error_detail = token_response.text
                 error_code = None
@@ -116,7 +139,6 @@ async def google_callback(request: Request, code: str = None, state: str = None)
                 except:
                     pass
                 
-                # If it's an invalid_grant error, the code might have been used already
                 if error_code == "invalid_grant":
                     return JSONResponse(
                         {
@@ -132,14 +154,13 @@ async def google_callback(request: Request, code: str = None, state: str = None)
                         "error": f"Token exchange failed: {error_detail}",
                         "error_code": error_code,
                         "status_code": token_response.status_code,
-                        "response_text": token_response.text[:500]  # First 500 chars of response
+                        "response_text": token_response.text[:500]
                     }, 
                     status_code=500
                 )
             
             token_info = token_response.json()
             
-            # Create credentials from token response, accepting all returned scopes
             returned_scopes = token_info.get("scope", "").split() if token_info.get("scope") else SCOPES
             credentials = Credentials(
                 token=token_info["access_token"],
@@ -164,6 +185,26 @@ async def google_callback(request: Request, code: str = None, state: str = None)
         if not credentials:
             return JSONResponse({"error": "Failed to obtain credentials"}, status_code=500)
 
+        # Get user info
+        try:
+            from googleapiclient.discovery import build
+            service = build("oauth2", "v2", credentials=credentials)
+            user_info = service.userinfo().get().execute()
+            user_email = user_info.get("email")
+            user_name = user_info.get("name")
+            
+            # Check if user exists in database
+            existing_user = get_user_by_email(user_email)
+            
+            if not existing_user:
+                # Create new user
+                new_user = create_user(user_email, user_name)
+                if new_user:
+                    # Start initialization in background thread
+                    run_initialization_in_background(new_user["uuid"], credentials)
+        except Exception as e:
+            print(f"Error checking/creating user: {e}")
+
         # Store tokens in HTTP-only cookie
         response = RedirectResponse(url="http://localhost:3000/?auth=success")
         response.set_cookie(
@@ -171,7 +212,7 @@ async def google_callback(request: Request, code: str = None, state: str = None)
             value=credentials.token,
             httponly=True,
             samesite="lax",
-            secure=False,  # Set to True in production with HTTPS
+            secure=False,
         )
         response.set_cookie(
             key="refresh_token",
@@ -225,7 +266,6 @@ def get_credentials_from_cookies(request: Request) -> Credentials | None:
     if credentials.expired and credentials.refresh_token:
         try:
             credentials.refresh(GoogleRequest())
-            # Update cookies with new token
         except:
             return None
 
@@ -248,249 +288,37 @@ async def get_profile(request: Request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
-@app.get("/api/email")
-async def get_email(request: Request):
-    """
-    Return Emails from Primary category, past 90 days.
-    default fetches the latest 100 emails from Primary category in the last 90 days, maxResults adjustable as needed.
-    """
-    credentials = get_credentials_from_cookies(request)
-    if not credentials:
-        return JSONResponse({"error": "Not authenticated"}, status_code=401)
-
-    try:
-        from googleapiclient.discovery import build
-
-        service = build("gmail", "v1", credentials=credentials)
-
-        # Primary category emails from last 90 days
-        gmail_query = "category:primary newer_than:90d"
-
-        # Fetch messages
-        results = service.users().messages().list(
-            userId="me",
-            q=gmail_query,
-            maxResults=100,
-        ).execute()
-
-        messages = results.get("messages", [])
-
-        email_list = []
-        for msg in messages:
-            msg_detail = service.users().messages().get(
-                userId="me", id=msg["id"]
-            ).execute()
-
-            snippet = msg_detail.get("snippet", "")
-
-            headers = msg_detail.get("payload", {}).get("headers", [])
-            subject = next(
-                (h["value"] for h in headers if h["name"] == "Subject"), ""
-            )
-            from_addr = next(
-                (h["value"] for h in headers if h["name"] == "From"), ""
-            )
-            date = next(
-                (h["value"] for h in headers if h["name"] == "Date"), ""
-            )
-
-            email_list.append({
-                "id": msg["id"],
-                "from": from_addr,
-                "subject": subject,
-                "date": date,
-                "snippet": snippet,
-            })
-
-        return {
-            "count": len(email_list),
-            "emails": email_list,
-            # nextPageToken is not typically provided in Gmail API list responses
-            "next_page_token": results.get("nextPageToken"),
-        }
-
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
-
-
-@app.get("/api/calendar")
-async def get_calendar(request: Request):
-    """
-    returns up to 2500 upcoming events from the primary calendar
-    """
-    credentials = get_credentials_from_cookies(request)
-    if not credentials:
-        return JSONResponse({"error": "Not authenticated"}, status_code=401)
-
-    try:
-        from googleapiclient.discovery import build
-        from datetime import datetime
-
-        service = build("calendar", "v3", credentials=credentials)
-
-        now = datetime.utcnow().isoformat() + "Z"  # RFC3339 UTC
-
-        events_result = service.events().list(
-            calendarId="primary",
-            timeMin=now,
-            maxResults=2500,        # Google Calendar API Limit
-            singleEvents=True,      # Expand recurring events
-            orderBy="startTime"
-        ).execute()
-
-        events = events_result.get("items", [])
-
-        formatted = []
-        for e in events:
-            formatted.append({
-                "id": e.get("id"),
-                "summary": e.get("summary"),
-                "description": e.get("description"),
-                "location": e.get("location"),
-                "start": e.get("start"),  # can be dateTime or date
-                "end": e.get("end"),
-            })
-
-        return {
-            "count": len(formatted),
-            "events": formatted,
-            "next_page_token": events_result.get("nextPageToken"),
-        }
-
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
-
-
-@app.get("/api/drive")
-async def get_drive(request: Request, path: str = "/"):
-    """
-    Google Drive path-based explorer.
-    
-    Behavior:
-    - If `path` points to a folder → return folder info + children list.
-    - If `path` points to a file   → return file info (same format as folder children).
-    
-    Path examples:
-        /                → Drive root
-        /Reports         → Folder "Reports"
-        /Reports/a.pdf   → File inside Reports
-    
-    Note:
-        - User must grant https://www.googleapis.com/auth/drive.readonly
-        - Download URLs require Bearer token in headers.
-    """
-
-    credentials = get_credentials_from_cookies(request)
-    if not credentials:
-        return JSONResponse({"error": "Not authenticated"}, status_code=401)
-
-    try:
-        from googleapiclient.discovery import build
-
-        # Normalize path
-        path = path.strip()
-        if path == "":
-            path = "/"
-
-        service = build("drive", "v3", credentials=credentials)
-        
-        # 1. Resolve path to Drive file/folder ID
-
-        root_id = "root"
-
-        def find_item_by_name(parent_id, name):
-            """Find a direct child inside parent folder by exact name."""
-            query = f"'{parent_id}' in parents and name = '{name}' and trashed = false"
-            result = service.files().list(
-                q=query,
-                fields="files(id, name, mimeType, size, modifiedTime)"
-            ).execute()
-            files = result.get("files", [])
-            return files[0] if files else None
-
-        def resolve_path(path: str):
-            """Resolve hierarchical path into a Drive file or folder."""
-            if path in ["", "/"]:
-                return {"id": root_id, "is_folder": True, "name": ""}
-
-            parts = [p for p in path.split("/") if p]
-            current_id = root_id
-            item = None
-
-            for part in parts:
-                item = find_item_by_name(current_id, part)
-                if not item:
-                    return None
-                current_id = item["id"]
-
-            return {
-                "id": item["id"],
-                "is_folder": item["mimeType"] == "application/vnd.google-apps.folder",
-                "name": item["name"],
-                "meta": item,
-            }
-
-        target = resolve_path(path)
-        if not target:
-            return JSONResponse({"error": f"Path not found: {path}"}, status_code=404)
-
-        file_id = target["id"]
-
-        # 2. Common helper: build file metadata
-        
-        def file_metadata(f):
-            """Return unified metadata format for a file."""
-            is_folder = f["mimeType"] == "application/vnd.google-apps.folder"
-
-            return {
-                "id": f["id"],
-                "name": f["name"],
-                "mimeType": f["mimeType"],
-                "is_folder": is_folder,
-                "size": f.get("size"),
-                "modified_time": f.get("modifiedTime"),
-                "download_url": None if is_folder else
-                    f"https://www.googleapis.com/drive/v3/files/{f['id']}?alt=media"
-            }
-
-        # 3. If it is a FILE → return file metadata
-        if not target["is_folder"]:
-            return {
-                "type": "file",
-                "path": path,
-                "info": file_metadata(target["meta"]),
-            }
-
-        # 4. If it is a FOLDER → list contents
-        
-        query = f"'{file_id}' in parents and trashed = false"
-        results = service.files().list(
-            q=query,
-            fields="files(id, name, mimeType, size, modifiedTime)"
-        ).execute()
-
-        children = [file_metadata(f) for f in results.get("files", [])]
-
-        return {
-            "type": "folder",
-            "path": path,
-            "children": children,
-        }
-
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
-
-
 @app.get("/api/auth/status")
 async def auth_status(request: Request):
-    """Check authentication status"""
+    """Check authentication status and initialization progress"""
     credentials = get_credentials_from_cookies(request)
     if credentials:
         try:
             from googleapiclient.discovery import build
             service = build("oauth2", "v2", credentials=credentials)
             user_info = service.userinfo().get().execute()
-            return {"authenticated": True, "user": user_info}
+            
+            # Get user from database to check initialization status
+            user_email = user_info.get("email")
+            db_user = get_user_by_email(user_email)
+            
+            if db_user:
+                return {
+                    "authenticated": True,
+                    "user": user_info,
+                    "status": db_user.get("status", "pending"),
+                    "init_phase": db_user.get("init_phase", "not_started"),
+                    "init_progress": db_user.get("init_progress", 0)
+                }
+            else:
+                # User authenticated but not in database yet
+                return {
+                    "authenticated": True,
+                    "user": user_info,
+                    "status": "pending",
+                    "init_phase": "not_started",
+                    "init_progress": 0
+                }
         except:
             return {"authenticated": False}
     return {"authenticated": False}
@@ -509,9 +337,7 @@ async def logout(request: Request):
                 "token": credentials.token
             }
             revoke_response = requests.post(revoke_url, data=revoke_data)
-            # Note: Google returns 200 even if token was already revoked
         except Exception as e:
-            # Log error but continue with logout
             pass
     
     # Clear cookies
@@ -523,7 +349,118 @@ async def logout(request: Request):
     return response
 
 
+@app.post("/api/chat")
+async def chat(request: Request):
+    """
+    Stream chat responses with RAG (Retrieval Augmented Generation).
+    Expects JSON: { "message": str, "history": [ {role: str, content: str}, ... ] }
+    """
+    credentials = get_credentials_from_cookies(request)
+    if not credentials:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+    
+    try:
+        # Get user info
+        from googleapiclient.discovery import build
+        service = build("oauth2", "v2", credentials=credentials)
+        user_info = service.userinfo().get().execute()
+        user_email = user_info.get("email")
+        
+        # Get user from database
+        db_user = get_user_by_email(user_email)
+        if not db_user or db_user.get("status") != "active":
+            return JSONResponse({"error": "User not initialized"}, status_code=400)
+        
+        user_id = db_user["uuid"]
+        
+        # Parse request body
+        body = await request.json()
+        user_message = body.get("message", "")
+        history = body.get("history", [])
+        
+        if not user_message:
+            return JSONResponse({"error": "No message provided"}, status_code=400)
+        
+        # Build search query
+        search_query = user_message
+        
+        # If there's history, summarize it as context
+        if history:
+            # Get last few messages for context
+            recent_history = history[-4:] if len(history) > 4 else history
+            history_text = "\n".join([f"{msg['role']}: {msg['content']}" for msg in recent_history])
+            try:
+                context_summary = summarize(history_text, max_chars=2000)
+                search_query = f"{context_summary}\n\nNew message: {user_message}"
+            except:
+                # If summarization fails, just use the user message
+                pass
+        
+        # Perform combined search (vector only, not keyword/fuzzy for chat)
+        search_results = combined_search(
+            user_id=user_id,
+            query=search_query,
+            vector_weight=1.0,
+            keyword_weight=0.0,
+            fuzzy_weight=0.0,
+            top_k=5
+        )
+        
+        # Get context and references from search results
+        context_str, references = get_context_from_results(user_id, search_results)
+        
+        # Build system message with context
+        system_message = {
+            "role": "system",
+            "content": (
+                "You are a helpful assistant with access to the user's emails, calendar events, and files. "
+                "Use the provided context to answer questions accurately. "
+                "If the context doesn't contain relevant information, say so honestly."
+            )
+        }
+        
+        # Build user message with context
+        enhanced_user_message = user_message
+        if context_str:
+            enhanced_user_message = f"Context:\n{context_str}\n\n---\n\nUser question: {user_message}"
+        
+        # Build messages for chat
+        messages = [system_message]
+        
+        # Add history (without context, as it's already in the enhanced message)
+        for msg in history:
+            messages.append({"role": msg["role"], "content": msg["content"]})
+        
+        # Add current enhanced user message
+        messages.append({"role": "user", "content": enhanced_user_message})
+        
+        # Stream response
+        async def generate():
+            try:
+                # Stream chat response
+                for chunk in chat_stream(messages):
+                    yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
+                
+                # Send references at the end
+                if references:
+                    yield f"data: {json.dumps({'type': 'references', 'references': references})}\n\n"
+                
+                # Send done signal
+                yield f"data: {json.dumps({'type': 'done'})}\n\n"
+            
+            except Exception as e:
+                yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+        
+        return StreamingResponse(generate(), media_type="text/event-stream")
+    
+    except Exception as e:
+        import traceback
+        return JSONResponse(
+            {"error": str(e), "traceback": traceback.format_exc()},
+            status_code=500
+        )
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8080)
-
