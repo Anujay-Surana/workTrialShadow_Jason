@@ -6,6 +6,7 @@ from retrieval_service.gemni_api_utils import embed_text
 from typing import List, Dict, Tuple
 import os
 from dotenv import load_dotenv
+from rapidfuzz import fuzz 
 
 load_dotenv()
 
@@ -305,139 +306,262 @@ def keyword_search(user_id: str, keywords: List[str], top_k: int = 10) -> List[D
 
 def fuzzy_search(user_id: str, query: str, top_k: int = 10) -> List[Dict]:
     """
-    Perform fuzzy text search using ILIKE with wildcards.
-    Note: Full-text search is not supported in Supabase Python client,
-    so we use ILIKE for fuzzy matching instead.
-    
-    Args:
-        user_id: User UUID
-        query: Search query
-        top_k: Max results per type
-    
-    Returns:
-        List of search results with scores
+    FULL fuzzy search across emails, schedules, files, attachments.
+    Covers ALL relevant text fields.
     """
     results = []
-    
-    # Search emails with fuzzy matching using ILIKE
-    try:
-        response = supabase.table('emails').select('id, subject, body').eq('user_id', user_id).ilike(
-            'subject', f'%{query}%'
-        ).limit(top_k).execute()
-        
+
+    # Helper: Compute a similarity score from available fields
+    def append_results(response, r_type, fields, id_field="id"):
         for item in response.data:
+            merged_text = " ".join([(item.get(f) or "") for f in fields])
+            score = fuzz.partial_ratio(query.lower(), merged_text.lower()) / 100.0
             results.append({
-                'type': 'email',
-                'id': item['id'],
-                'score': 0.4,  # Fixed score for fuzzy matches
-                'source': 'fuzzy'
+                "type": r_type,
+                "id": item[id_field],
+                "score": float(score),
+                "source": "fuzzy"
             })
-    except Exception as e:
-        print(f"Error in fuzzy search for emails: {e}")
-    
-    # Search schedules
+
+    # ======================================================
+    # EMAILS
+    # ======================================================
     try:
-        response = supabase.table('schedules').select('id, summary, description').eq('user_id', user_id).ilike(
-            'summary', f'%{query}%'
+        resp = supabase.table("emails").select(
+            "id, subject, body, from_user, to_user, cc, bcc"
+        ).eq("user_id", user_id).or_(
+            "subject.ilike.%{}%,body.ilike.%{}%,from_user.ilike.%{}%,to_user.ilike.%{}%,cc.ilike.%{}%,bcc.ilike.%{}%".format(
+                query, query, query, query, query, query
+            )
         ).limit(top_k).execute()
-        
-        for item in response.data:
-            results.append({
-                'type': 'schedule',
-                'id': item['id'],
-                'score': 0.4,
-                'source': 'fuzzy'
-            })
+
+        append_results(resp, "email",
+                       ["subject", "body", "from_user", "to_user", "cc", "bcc"])
     except Exception as e:
-        print(f"Error in fuzzy search for schedules: {e}")
-    
-    # Search files
+        print("Error in fuzzy email search:", e)
+
+    # ======================================================
+    # SCHEDULES
+    # ======================================================
     try:
-        response = supabase.table('files').select('id, name, summary').eq('user_id', user_id).ilike(
-            'name', f'%{query}%'
+        resp = supabase.table("schedules").select(
+            "id, summary, description, location"
+        ).eq("user_id", user_id).or_(
+            "summary.ilike.%{}%,description.ilike.%{}%,location.ilike.%{}%".format(
+                query, query, query
+            )
         ).limit(top_k).execute()
-        
-        for item in response.data:
-            results.append({
-                'type': 'file',
-                'id': item['id'],
-                'score': 0.4,
-                'source': 'fuzzy'
-            })
+
+        append_results(resp, "schedule",
+                       ["summary", "description", "location"])
     except Exception as e:
-        print(f"Error in fuzzy search for files: {e}")
-    
-    return results
+        print("Error in fuzzy schedule search:", e)
+
+    # ======================================================
+    # FILES
+    # ======================================================
+    try:
+        resp = supabase.table("files").select(
+            "id, name, path, summary, owner_email, owner_name"
+        ).eq("user_id", user_id).or_(
+            "name.ilike.%{}%,path.ilike.%{}%,summary.ilike.%{}%,owner_email.ilike.%{}%,owner_name.ilike.%{}%".format(
+                query, query, query, query, query
+            )
+        ).limit(top_k).execute()
+
+        append_results(resp, "file",
+                       ["name", "path", "summary", "owner_email", "owner_name"])
+    except Exception as e:
+        print("Error in fuzzy file search:", e)
+
+    # ======================================================
+    # ATTACHMENTS
+    # ======================================================
+    try:
+        resp = supabase.table("attachments").select(
+            "id, email_id, filename, summary"
+        ).eq("user_id", user_id).or_(
+            "filename.ilike.%{}%,summary.ilike.%{}%".format(query, query)
+        ).limit(top_k).execute()
+
+        append_results(resp, "attachment",
+                       ["filename", "summary"], id_field="id")
+    except Exception as e:
+        print("Error in fuzzy attachment search:", e)
+
+    # ======================================================
+    # GLOBAL SORTING
+    # ======================================================
+    results = sorted(results, key=lambda x: x["score"], reverse=True)
+
+    # Return top_k globally
+    return results[:top_k]
 
 
-def combined_search(user_id: str, query: str, keywords: List[str] = None, 
-                   vector_weight: float = 0.6, keyword_weight: float = 0.3, 
-                   fuzzy_weight: float = 0.1, top_k: int = None) -> List[Dict]:
-    """
-    Perform combined search using vector, keyword, and fuzzy search.
-    
-    Args:
-        user_id: User UUID
-        query: Search query text
-        keywords: Optional keywords to search (extracted from query if not provided)
-        vector_weight: Weight for vector search results
-        keyword_weight: Weight for keyword search results
-        fuzzy_weight: Weight for fuzzy search results
-        top_k: Number of final results to return (uses DEFAULT_TOP_K from env if None)
-    
-    Returns:
-        List of top-k search results with references
-    """
-    # Use default top_k from environment if not provided
+def combined_search(
+    user_id: str,
+    query: str,
+    keywords: List[str] = None,
+    vector_weight: float = 0.6,
+    keyword_weight: float = 0.4,
+    fuzzy_weight: float = 0.6,
+    top_k: int = None
+) -> List[Dict]:
+
     if top_k is None:
         top_k = DEFAULT_TOP_K
-    
+
     # Generate embedding for vector search
     query_embedding = embed_text(query)
-    
+
     # Perform vector search
     vector_results = vector_search(user_id, query_embedding, top_k=top_k)
-    
+
     # Extract keywords if not provided
     if keywords is None:
-        # Simple keyword extraction (split by space, remove common words)
-        stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by'}
-        keywords = [w for w in query.lower().split() if w not in stop_words and len(w) > 2]
-    
+        stop_words = {
+            # articles / determiners
+            "a", "an", "the", "this", "that", "these", "those",
+
+            # conjunctions
+            "and", "or", "but", "so", "yet",
+
+            # prepositions
+            "in", "on", "at", "to", "for", "of", "with", "from", "into",
+            "during", "including", "until", "against", "among", "throughout",
+            "despite", "towards", "upon", "about", "above", "below", "under",
+            "over", "between", "without", "within", "along", "across",
+
+            # pronouns
+            "i", "you", "he", "she", "it", "we", "they",
+            "me", "him", "her", "them", "us",
+            "my", "your", "his", "her", "its", "our", "their",
+            "mine", "yours", "ours", "theirs",
+
+            # auxiliary verbs
+            "am", "is", "are", "was", "were",
+            "be", "been", "being",
+            "do", "does", "did",
+            "have", "has", "had",
+
+            # modal verbs
+            "can", "could", "should", "would", "will", "shall",
+            "may", "might", "must",
+
+            # filler verbs that carry no meaning in search
+            "find", "show", "give", "tell", "get", "look",
+            "help", "let", "need", "want", "see",
+
+            # WH fillers (not the meaningful ones like "where" or "who")
+            "what", "how",
+
+            # question/polite fillers
+            "please", "thanks", "thank", "hi", "hello",
+            "hey", "ok", "okay", "sure",
+
+            # padding words
+            "just", "really", "very", "quite", "maybe", "perhaps",
+            "like", "kind", "sort", "thing", "stuff",
+            "also", "still", "almost",
+
+            # frequency/time fillers
+            "today", "now", "then", "later",
+
+            # others
+            "myself", "yourself", "ourselves", "themselves",
+            "any", "some", "all", "both", "each", "every",
+            "few", "more", "most", "other", "same"
+            
+            # verbs like "is", "are", "was", "were" are already included above
+            "is", "are", "was", "were", "find", "show", "give", "tell"
+        }
+
+        keywords = [
+            w.replace("?","").replace(".","").replace(",","") for w in query.lower().split()
+            if w not in stop_words and len(w) > 2
+        ]
+
     # Perform keyword search
     keyword_results = keyword_search(user_id, keywords, top_k=top_k) if keywords else []
-    
+    print("keyword results:", keyword_results)
+
     # Perform fuzzy search
     fuzzy_results = fuzzy_search(user_id, query, top_k=top_k)
-    
-    # Combine results with weights
+
+    # --- WEAK VECTOR BOOST ---
+    weak_vectors = all(v['score'] < 0.5 for v in vector_results) if vector_results else True
+
+    if weak_vectors:
+        print("Vector search weak (<0.5): boosting keyword + fuzzy weights")
+        vector_weight = 0.3
+        keyword_weight = 0.4
+        fuzzy_weight = 0.3
+
+    # --- COMBINE SCORES ---
     combined_scores = {}
-    
-    for result in vector_results:
+
+    def add_score(result, weight):
         key = (result['type'], result['id'])
         if key not in combined_scores:
-            combined_scores[key] = {'type': result['type'], 'id': result['id'], 'score': 0.0, 'sources': []}
-        combined_scores[key]['score'] += result['score'] * vector_weight
-        combined_scores[key]['sources'].append('vector')
-    
-    for result in keyword_results:
-        key = (result['type'], result['id'])
-        if key not in combined_scores:
-            combined_scores[key] = {'type': result['type'], 'id': result['id'], 'score': 0.0, 'sources': []}
-        combined_scores[key]['score'] += result['score'] * keyword_weight
-        combined_scores[key]['sources'].append('keyword')
-    
-    for result in fuzzy_results:
-        key = (result['type'], result['id'])
-        if key not in combined_scores:
-            combined_scores[key] = {'type': result['type'], 'id': result['id'], 'score': 0.0, 'sources': []}
-        combined_scores[key]['score'] += result['score'] * fuzzy_weight
-        combined_scores[key]['sources'].append('fuzzy')
-    
-    # Sort by score and get top-k
-    sorted_results = sorted(combined_scores.values(), key=lambda x: x['score'], reverse=True)[:top_k]
-    
-    return sorted_results
+            combined_scores[key] = {
+                'type': result['type'],
+                'id': result['id'],
+                'score': 0.0,
+                'sources': []
+            }
+        combined_scores[key]['score'] += result['score'] * weight
+        combined_scores[key]['sources'].append(result['source'])
+
+    for r in vector_results:
+        add_score(r, vector_weight)
+    for r in keyword_results:
+        add_score(r, keyword_weight)
+    for r in fuzzy_results:
+        add_score(r, fuzzy_weight)
+
+    # --- SORT ---
+    sorted_results = sorted(
+        combined_scores.values(),
+        key=lambda x: x['score'],
+        reverse=True
+    )
+
+    # -------------------------------
+    #   ENSURE 1 KEYWORD + 1 FUZZY
+    # -------------------------------
+
+    keyword_included = any('keyword' in r['sources'] for r in sorted_results)
+    fuzzy_included = any('fuzzy' in r['sources'] for r in sorted_results)
+
+    # Insert keyword result if missing
+    if not keyword_included and keyword_results:
+        best_keyword = keyword_results[0]
+        key = (best_keyword['type'], best_keyword['id'])
+        forced_entry = combined_scores[key]
+        print("Forcing best keyword result into list")
+        sorted_results.append(forced_entry)
+
+    # Insert fuzzy result if missing
+    if not fuzzy_included and fuzzy_results:
+        best_fuzzy = fuzzy_results[0]
+        key = (best_fuzzy['type'], best_fuzzy['id'])
+        forced_entry = combined_scores[key]
+        print("Forcing best fuzzy result into list")
+        sorted_results.append(forced_entry)
+
+    # Deduplicate again after forced insertions
+    seen = set()
+    unique_sorted = []
+    for r in sorted_results:
+        key = (r['type'], r['id'])
+        if key not in seen:
+            seen.add(key)
+            unique_sorted.append(r)
+
+    # Final trim
+    final_sorted = unique_sorted[:top_k]
+
+    return final_sorted
 
 
 def get_context_from_results(user_id: str, search_results: List[Dict]) -> Tuple[str, List[Dict]]:
@@ -464,7 +588,8 @@ def get_context_from_results(user_id: str, search_results: List[Dict]) -> Tuple[
                 if response.data:
                     email = response.data[0]
                     context_parts.append(
-                        f"[Email] From: {email.get('from_user', 'unknown')}, "
+                        f"[Email] From: {email.get('from_user', 'unknown')}, To: {email.get('to_user', 'unknown')}\n, CC: {email.get('cc', '')}, BCC: {email.get('bcc', '')}\n"
+                        f"Email ID: {email.get('id', 'unknown')}\n"
                         f"Subject: {email.get('subject', 'No subject')}, "
                         f"Date: {email.get('date', 'unknown')}\n"
                         f"Content: {email.get('body', '')}\n"
@@ -501,6 +626,9 @@ def get_context_from_results(user_id: str, search_results: List[Dict]) -> Tuple[
                     file = response.data[0]
                     context_parts.append(
                         f"[File] {file.get('name', 'unknown')}\n"
+                        f"ID: {file.get('id', 'unknown')}\n"
+                        f'Size: {file.get("size", "unknown")} bytes\n'
+                        f"Metadata: {file.get('metadata', 'No metadata')}\n"
                         f"Path: {file.get('path', 'unknown')}\n"
                         f"Type: {file.get('mime_type', 'unknown')}\n"
                         f"Summary: {file.get('summary', 'No summary available')}\n"
@@ -530,6 +658,7 @@ def get_context_from_results(user_id: str, search_results: List[Dict]) -> Tuple[
                     
                     # Build context with email information
                     context_text = f"[Email Attachment] {attachment.get('filename', 'unknown')}\n"
+                    context_text += f"ID: {attachment.get('id', 'unknown')}\n"
                     context_text += f"Type: {attachment.get('mime_type', 'unknown')}\n"
                     context_text += f"Size: {attachment.get('size', 'unknown')} bytes\n"
                     

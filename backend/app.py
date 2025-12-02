@@ -11,8 +11,15 @@ import requests
 from datetime import datetime, timedelta
 import threading
 import asyncio
+from typing import Dict, Optional
+import time
+from fastapi.responses import StreamingResponse
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
+import io
+import base64
 
-from retrieval_service.google_api_utils import initialize_user_data
+from retrieval_service.google_api_utils import get_drive_public_download_link, get_gmail_attachment_download_link, initialize_user_data
 from retrieval_service.supabase_utils import get_user_by_email, create_user, update_user_status
 from retrieval_service.search_utils import combined_search, get_context_from_results
 from retrieval_service.openai_api_utils import chat_stream, summarize
@@ -26,6 +33,46 @@ init_model(['en'])
 print("OCR model loaded.")
 
 app = FastAPI()
+
+# User info cache to reduce Google API calls
+# Structure: {token_hash: {"user_info": {...}, "expires_at": timestamp}}
+user_info_cache: Dict[str, Dict] = {}
+CACHE_DURATION = 60  # Cache user info for 60 seconds
+cache_lock = threading.Lock()
+
+def get_token_hash(token: str) -> str:
+    """Create a hash of the token for cache key"""
+    import hashlib
+    return hashlib.sha256(token.encode()).hexdigest()
+
+def get_cached_user_info(token: str) -> Optional[dict]:
+    """Get user info from cache if valid"""
+    with cache_lock:
+        token_hash = get_token_hash(token)
+        if token_hash in user_info_cache:
+            cache_entry = user_info_cache[token_hash]
+            if cache_entry["expires_at"] > time.time():
+                return cache_entry["user_info"]
+            else:
+                # Expired, remove from cache
+                del user_info_cache[token_hash]
+        return None
+
+def set_cached_user_info(token: str, user_info: dict):
+    """Cache user info with expiration"""
+    with cache_lock:
+        token_hash = get_token_hash(token)
+        user_info_cache[token_hash] = {
+            "user_info": user_info,
+            "expires_at": time.time() + CACHE_DURATION
+        }
+
+def clear_cached_user_info(token: str):
+    """Clear cached user info for a token"""
+    with cache_lock:
+        token_hash = get_token_hash(token)
+        if token_hash in user_info_cache:
+            del user_info_cache[token_hash]
 
 # CORS configuration
 app.add_middleware(
@@ -279,15 +326,25 @@ def get_credentials_from_cookies(request: Request) -> Credentials | None:
 
 @app.get("/api/profile")
 async def get_profile(request: Request):
-    """Get user profile using stored access token"""
+    """Get user profile using stored access token (with caching)"""
     credentials = get_credentials_from_cookies(request)
     if not credentials:
         return JSONResponse({"error": "Not authenticated"}, status_code=401)
 
     try:
+        # Check cache first
+        cached_info = get_cached_user_info(credentials.token)
+        if cached_info:
+            return cached_info
+        
+        # Cache miss - fetch from Google
         from googleapiclient.discovery import build
         service = build("oauth2", "v2", credentials=credentials)
         user_info = service.userinfo().get().execute()
+        
+        # Cache the result
+        set_cached_user_info(credentials.token, user_info)
+        
         return user_info
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -295,13 +352,21 @@ async def get_profile(request: Request):
 
 @app.get("/api/auth/status")
 async def auth_status(request: Request):
-    """Check authentication status and initialization progress"""
+    """Check authentication status and initialization progress (with caching)"""
     credentials = get_credentials_from_cookies(request)
     if credentials:
         try:
-            from googleapiclient.discovery import build
-            service = build("oauth2", "v2", credentials=credentials)
-            user_info = service.userinfo().get().execute()
+            # Check cache first to avoid frequent Google API calls
+            user_info = get_cached_user_info(credentials.token)
+            
+            if not user_info:
+                # Cache miss - fetch from Google
+                from googleapiclient.discovery import build
+                service = build("oauth2", "v2", credentials=credentials)
+                user_info = service.userinfo().get().execute()
+                
+                # Cache the result
+                set_cached_user_info(credentials.token, user_info)
             
             # Get user from database to check initialization status
             user_email = user_info.get("email")
@@ -331,11 +396,14 @@ async def auth_status(request: Request):
 
 @app.post("/api/auth/logout")
 async def logout(request: Request):
-    """Logout, revoke token, and clear cookies"""
+    """Logout, revoke token, clear cache, and clear cookies"""
     credentials = get_credentials_from_cookies(request)
     
-    # Revoke the token with Google if we have credentials
+    # Clear cache for this token
     if credentials and credentials.token:
+        clear_cached_user_info(credentials.token)
+        
+        # Revoke the token with Google
         try:
             revoke_url = "https://oauth2.googleapis.com/revoke"
             revoke_data = {
@@ -365,10 +433,18 @@ async def chat(request: Request):
         return JSONResponse({"error": "Not authenticated"}, status_code=401)
     
     try:
-        # Get user info
-        from googleapiclient.discovery import build
-        service = build("oauth2", "v2", credentials=credentials)
-        user_info = service.userinfo().get().execute()
+        # Get user info (with caching)
+        user_info = get_cached_user_info(credentials.token)
+        
+        if not user_info:
+            # Cache miss - fetch from Google
+            from googleapiclient.discovery import build
+            service = build("oauth2", "v2", credentials=credentials)
+            user_info = service.userinfo().get().execute()
+            
+            # Cache the result
+            set_cached_user_info(credentials.token, user_info)
+        
         user_email = user_info.get("email")
         
         # Get user from database
@@ -429,6 +505,11 @@ async def chat(request: Request):
                 f"Current date and time: {current_datetime} ({weekday_name}). "
                 f"Use the provided context to answer questions accurately. "
                 f"If the context doesn't contain relevant information, say so honestly."
+                f"User's info: \n{user_info}"
+                f"if you want to provide the download links to the user, use the following format: [Title](URL)"
+                f"The download link can be obtained from the ids of attachments or drive files:"
+                f" - For Google Drive files, use http:localhost:8080/api/download/drive-direct/{{file_db_id}}"
+                f" - For Gmail attachments, use http:localhost:8080/api/download/attachment-direct/{{attachment_db_id}}"
             )
         }
         
@@ -450,9 +531,13 @@ async def chat(request: Request):
         # Stream response
         async def generate():
             try:
-                # Stream chat response
+                # Stream chat response with immediate flushing
                 for chunk in chat_stream(messages):
-                    yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
+                    # Send chunk immediately
+                    data = f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
+                    yield data
+                    # Small delay to ensure chunks are sent individually
+                    await asyncio.sleep(0)
                 
                 # Send references at the end
                 if references:
@@ -464,7 +549,15 @@ async def chat(request: Request):
             except Exception as e:
                 yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
         
-        return StreamingResponse(generate(), media_type="text/event-stream")
+        return StreamingResponse(
+            generate(), 
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"  # Disable nginx buffering
+            }
+        )
     
     except Exception as e:
         import traceback
@@ -472,6 +565,120 @@ async def chat(request: Request):
             {"error": str(e), "traceback": traceback.format_exc()},
             status_code=500
         )
+
+@app.get("/api/download/drive-direct/{file_id}")
+async def download_drive_file_direct(file_id: str, request: Request):
+    """
+    Server-side Google Drive download using user OAuth
+    Works for Google Docs, Sheets, Slides, binary files.
+    """
+    credentials = get_credentials_from_cookies(request)
+    if not credentials:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+
+    try:
+        service = build("drive", "v3", credentials=credentials)
+
+        # 1. Get metadata to check type
+        meta = service.files().get(
+            fileId=file_id,
+            fields="id, name, mimeType"
+        ).execute()
+
+        name = meta["name"]
+        mime_type = meta["mimeType"]
+
+        # 2. Handle Workspace exports
+        export_map = {
+            "application/vnd.google-apps.document":
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/vnd.google-apps.spreadsheet":
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/vnd.google-apps.presentation":
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        }
+
+        # 3. Download
+        if mime_type in export_map:
+            request_drive = service.files().export_media(
+                fileId=file_id,
+                mimeType=export_map[mime_type]
+            )
+            download_name = f"{name}.docx"
+        else:
+            request_drive = service.files().get_media(fileId=file_id)
+            download_name = name
+
+        file_bytes = io.BytesIO()
+        downloader = MediaIoBaseDownload(file_bytes, request_drive)
+
+        done = False
+        while not done:
+            status, done = downloader.next_chunk()
+
+        file_bytes.seek(0)
+
+        return StreamingResponse(
+            file_bytes,
+            media_type="application/octet-stream",
+            headers={
+                "Content-Disposition": f'attachment; filename="{download_name}"'
+            }
+        )
+
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+@app.get("/api/download/attachment-direct/{attachment_id}")
+async def download_attachment_direct(attachment_id: str, request: Request):
+    """
+    Server-side Gmail attachment download.
+    Works for ANY attachment (images, PDF, docx, zip...).
+    """
+    credentials = get_credentials_from_cookies(request)
+    if not credentials:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+
+    try:
+        # 1. Look up attachment metadata in DB
+        from retrieval_service.supabase_utils import supabase
+        resp = supabase.table("attachments").select("*").eq("id", attachment_id).execute()
+
+        if not resp.data:
+            return JSONResponse({"error": "Attachment not found"}, status_code=404)
+
+        attachment = resp.data[0]
+        message_id = attachment["email_id"]
+        filename = attachment.get("filename", "attachment")
+
+        # 2. Connect to Gmail API
+        service = build("gmail", "v1", credentials=credentials)
+
+        # 3. Fetch attachment data
+        att = service.users().messages().attachments().get(
+            userId="me",
+            messageId=message_id,
+            id=attachment_id
+        ).execute()
+
+        raw_data = att.get("data")
+        if not raw_data:
+            return JSONResponse({"error": "Attachment contains no data"}, status_code=500)
+
+        # 4. Decode base64 URL-safe data
+        file_bytes = base64.urlsafe_b64decode(raw_data)
+
+        # 5. Return as downloadable file
+        return StreamingResponse(
+            io.BytesIO(file_bytes),
+            media_type="application/octet-stream",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"'
+            }
+        )
+
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 if __name__ == "__main__":

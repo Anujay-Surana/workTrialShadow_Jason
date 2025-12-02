@@ -1,3 +1,4 @@
+from datetime import timedelta
 import time
 import io
 import threading
@@ -127,10 +128,11 @@ def fetch_calendar_events(credentials, max_results=2500):
 
     from datetime import datetime
     now = datetime.utcnow().isoformat() + "Z"
+    two_weeks_ago = (now - timedelta(days=14)).isoformat() + "Z"
 
     resp = service.events().list(
         calendarId="primary",
-        timeMin=now,
+        timeMin=two_weeks_ago,
         maxResults=max_results,
         singleEvents=True,
         orderBy="startTime"
@@ -888,3 +890,47 @@ async def initialize_user_data(user_id: str, credentials, progress_callback=None
             progress_callback("failed", 0)
     
     return results
+
+
+#=======================================================
+def get_drive_public_download_link(file):
+    """
+    Return a public, no-auth download/export URL for a Google Drive file.
+    File metadata should include {id, mime_type}.
+    """
+    file_id = file.get("id")
+    mime_type = file.get("mime_type")
+
+    # Google Workspace Export MIME Types
+    workspace_export_map = {
+        "application/vnd.google-apps.document":
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",  # DOCX
+        "application/vnd.google-apps.spreadsheet":
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",       # XLSX
+        "application/vnd.google-apps.presentation":
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation", # PPTX
+        "application/vnd.google-apps.drawing":
+            "application/pdf"
+    }
+
+    # Workspace file → export URL
+    if mime_type in workspace_export_map:
+        export_type = workspace_export_map[mime_type]
+        return (
+            f"https://www.googleapis.com/drive/v3/files/{file_id}/export"
+            f"?mimeType={export_type}"
+        )
+
+    # Binary file → direct download
+    return f"https://drive.google.com/uc?export=download&id={file_id}"
+
+def get_gmail_attachment_download_link(message_id: str, attachment_id: str) -> str:
+    """
+    Return the public Gmail attachment download endpoint.
+    Browser will use user's Gmail session cookies.
+    No OAuth or API key required for GET request via browser.
+    """
+    return (
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages/"
+        f"{message_id}/attachments/{attachment_id}"
+    )
