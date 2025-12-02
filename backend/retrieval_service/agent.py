@@ -7,7 +7,7 @@ SEARCH_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "semantic_search",
+            "name": "vector_search",
             "description": "Semantic vector search over the user's emails, calendar events, files and attachments. Use when you want meaning-based search.",
             "parameters": {
                 "type": "object",
@@ -104,7 +104,7 @@ You are a ReAct (Reason + Act) assistant for personal retrieval on top of the us
 - Gmail attachments
 
 You have access to three tools:
-1) semantic_search: semantic/vector search across all personal data.
+1) vector_search: semantic/vector search across all personal data.
 2) keyword_search: keyword-based search where YOU can choose specific keywords.
 3) fuzzy_search: fuzzy search for approximate matches and typos.
 

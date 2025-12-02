@@ -2,7 +2,7 @@ const API_BASE_URL = 'http://localhost:8080';
 
 let chatHistory = [];
 let isStreaming = false;
-let currentMode = 'rag';  // Default to RAG mode
+let currentMode = 'rag';  // Default to RAG mode: 'rag', 'mixed', or 'react'
 
 // Check authentication status on page load
 async function checkAuthStatus() {
@@ -41,13 +41,30 @@ function showChatUI(user) {
 function switchToRagMode() {
     currentMode = 'rag';
     document.getElementById('ragModeBtn').classList.add('active');
-    document.getElementById('agentModeBtn').classList.remove('active');
+    document.getElementById('mixedModeBtn').classList.remove('active');
+    document.getElementById('reactModeBtn').classList.remove('active');
 }
 
-function switchToAgentMode() {
-    currentMode = 'agent';
-    document.getElementById('agentModeBtn').classList.add('active');
+function switchToMixedMode() {
+    currentMode = 'mixed';
     document.getElementById('ragModeBtn').classList.remove('active');
+    document.getElementById('mixedModeBtn').classList.add('active');
+    document.getElementById('reactModeBtn').classList.remove('active');
+}
+
+function switchToReactMode() {
+    currentMode = 'react';
+    document.getElementById('ragModeBtn').classList.remove('active');
+    document.getElementById('mixedModeBtn').classList.remove('active');
+    document.getElementById('reactModeBtn').classList.add('active');
+}
+
+// Clear chat history
+function clearChat() {
+    if (confirm('Are you sure you want to clear the chat history?')) {
+        chatHistory = [];
+        document.getElementById('chatMessages').innerHTML = '';
+    }
 }
 
 // Handle Sign Out button click
@@ -314,7 +331,64 @@ async function sendMessage() {
                         
                         const data = JSON.parse(jsonStr);
                         
-                        if (data.type === 'search_start' || data.type === 'generation_start') {
+                        if (data.type === 'react_step') {
+                            // Real ReAct agent: show thinking and action (collapsible)
+                            const stepDiv = document.createElement('div');
+                            stepDiv.className = 'react-step collapsed';
+                            
+                            // Extract key info (Thought and Action lines)
+                            const lines = data.content.split('\n');
+                            let thought = '';
+                            let action = '';
+                            
+                            for (const line of lines) {
+                                if (line.startsWith('Thought:')) {
+                                    thought = line.substring(8).trim();
+                                }
+                                if (line.startsWith('Action:')) {
+                                    action = line.substring(7).trim();
+                                }
+                            }
+                            
+                            const summary = `Step ${data.iteration}: ${action || thought.substring(0, 50) + '...'}`;
+                            
+                            stepDiv.innerHTML = `
+                                <div class="react-step-header" onclick="this.parentElement.classList.toggle('collapsed')">
+                                    <span class="react-step-icon">▶</span>
+                                    <span class="react-step-summary">${summary}</span>
+                                </div>
+                                <div class="react-step-details">
+                                    <pre>${data.content}</pre>
+                                </div>
+                            `;
+                            contentDiv.appendChild(stepDiv);
+                            messagesContainer.scrollTop = messagesContainer.scrollHeight;
+                        } else if (data.type === 'react_observation') {
+                            // Real ReAct agent: show observation (collapsible)
+                            const obsDiv = document.createElement('div');
+                            obsDiv.className = 'react-observation collapsed';
+                            
+                            // Count results for summary
+                            const resultCount = (data.observation.match(/Result \d+/g) || []).length;
+                            const summary = `${data.tool}: ${resultCount} result${resultCount !== 1 ? 's' : ''} found`;
+                            
+                            obsDiv.innerHTML = `
+                                <div class="react-obs-header" onclick="this.parentElement.classList.toggle('collapsed')">
+                                    <span class="react-obs-icon">▶</span>
+                                    <span class="react-obs-summary">${summary}</span>
+                                </div>
+                                <div class="react-obs-details">
+                                    <pre>${data.observation}</pre>
+                                </div>
+                            `;
+                            contentDiv.appendChild(obsDiv);
+                            messagesContainer.scrollTop = messagesContainer.scrollHeight;
+                        } else if (data.type === 'react_final') {
+                            // Real ReAct agent: final answer
+                            accumulatedContent = data.answer;
+                            contentDiv.innerHTML = marked.parse(accumulatedContent);
+                            messagesContainer.scrollTop = messagesContainer.scrollHeight;
+                        } else if (data.type === 'search_start' || data.type === 'generation_start') {
                             // Show status indicator for RAG mode
                             if (!contentDiv.querySelector('.status-indicator')) {
                                 const statusDiv = document.createElement('div');
@@ -442,7 +516,11 @@ document.addEventListener('DOMContentLoaded', () => {
     
     // Set up mode toggle buttons
     document.getElementById('ragModeBtn').addEventListener('click', switchToRagMode);
-    document.getElementById('agentModeBtn').addEventListener('click', switchToAgentMode);
+    document.getElementById('mixedModeBtn').addEventListener('click', switchToMixedMode);
+    document.getElementById('reactModeBtn').addEventListener('click', switchToReactMode);
+    
+    // Set up clear chat button
+    document.getElementById('clearBtn').addEventListener('click', clearChat);
     
     // Check auth status
     checkAuthStatus();

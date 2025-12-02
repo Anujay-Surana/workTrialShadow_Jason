@@ -21,14 +21,6 @@
     </div>
 
     <div class="chat-container">
-        <div class="mode-toggle-container">
-            <label class="mode-label">Mode:</label>
-            <div class="mode-toggle">
-                <button id="ragModeBtn" class="mode-btn active">RAG (Fast)</button>
-                <button id="agentModeBtn" class="mode-btn">Agent (Smart)</button>
-            </div>
-        </div>
-
         <div id="chatMessages" class="chat-messages"></div>
 
         <div class="chat-input-container">
@@ -39,6 +31,18 @@
                 placeholder="Ask about your emails, calendar, or files..."
             >
             <button id="sendBtn" class="send-btn">Send</button>
+        </div>
+
+        <div class="chat-controls">
+            <div class="mode-toggle-container">
+                <label class="mode-label">Mode:</label>
+                <div class="mode-toggle">
+                    <button id="ragModeBtn" class="mode-btn active">RAG</button>
+                    <button id="mixedModeBtn" class="mode-btn">Mixed</button>
+                    <button id="reactModeBtn" class="mode-btn">Agent</button>
+                </div>
+            </div>
+            <button id="clearBtn" class="clear-btn">Clear Chat</button>
         </div>
     </div>
 

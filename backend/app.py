@@ -454,7 +454,7 @@ async def chat(request: Request):
         body = await request.json()
         user_message = body.get("message", "")
         history = body.get("history", [])
-        mode = body.get("mode", "rag")  # Default to RAG mode
+        mode = body.get("mode", "rag")  # Default to RAG mode: "rag", "mixed", or "react"
 
         if not user_message:
             return JSONResponse({"error": "No message provided"}, status_code=400)
@@ -464,7 +464,8 @@ async def chat(request: Request):
         current_datetime = now.strftime("%Y-%m-%d %H:%M:%S")
 
         # Build system message based on mode
-        if mode == "agent":
+        if mode == "mixed":
+            # Mixed mode: RAG + optional tool calling
             system_content = REACT_SYSTEM_PROMPT + (
                 f"\n\nCurrent date and time: {current_datetime} ({weekday_name}).\n"
                 f"User info JSON (for your reference, do NOT leak sensitive fields verbatim):\n{user_info}\n\n"
@@ -474,7 +475,7 @@ async def chat(request: Request):
                 f"- For Gmail attachments, use http://localhost:8080/api/download/attachment-direct/{{attachment_db_id}}\n"
             )
         else:
-            # RAG mode uses a simpler system prompt
+            # RAG and React modes use simpler system prompt (React has its own in react_agent_utils)
             system_content = (
                 f"You are a helpful assistant with access to the user's personal data.\n"
                 f"Current date and time: {current_datetime} ({weekday_name}).\n\n"
@@ -498,13 +499,19 @@ async def chat(request: Request):
 
         async def generate():
             try:
-                if mode == "agent":
-                    # Use ReAct agent with tool calling
+                if mode == "react":
+                    # Real ReAct agent with Thought-Action-Observation loop
+                    from retrieval_service import react_agent_utils
+                    async for event in react_agent_utils.react_agent_stream(messages, user_id):
+                        yield "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
+                        await asyncio.sleep(0)
+                elif mode == "mixed":
+                    # Mixed mode: RAG + optional tool calling
                     async for event in openai_api_utils.react_with_tools_stream(messages, user_id):
                         yield "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
                         await asyncio.sleep(0)
                 else:
-                    # Use direct RAG mode (default)
+                    # Direct RAG mode (default)
                     async for event in openai_api_utils.rag_direct_stream(messages, user_id, user_message, user_info):
                         yield "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
                         await asyncio.sleep(0)
