@@ -1,4 +1,3 @@
-from datetime import timedelta
 import time
 import io
 import threading
@@ -20,6 +19,7 @@ from retrieval_service.thread_pool_manager import get_thread_pool_manager
 
 from retrieval_service.ocr_utils import extractOCR, isIMG
 from retrieval_service.doc_utils import extractDOC, isDOC
+from datetime import datetime, timezone, timedelta
 
 
 # ======================================================
@@ -125,10 +125,12 @@ def extract_attachments(message, email_id):
 
 def fetch_calendar_events(credentials, max_results=2500):
     service = build("calendar", "v3", credentials=credentials)
+    
+    now_dt = datetime.now(timezone.utc)
+    two_weeks_ago_dt = now_dt - timedelta(days=14)
 
-    from datetime import datetime
-    now = datetime.utcnow().isoformat() + "Z"
-    two_weeks_ago = (now - timedelta(days=14)).isoformat() + "Z"
+    now = now_dt.isoformat().replace("+00:00", "Z")
+    two_weeks_ago = two_weeks_ago_dt.isoformat().replace("+00:00", "Z")
 
     resp = service.events().list(
         calendarId="primary",
