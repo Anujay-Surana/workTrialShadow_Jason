@@ -1,3 +1,4 @@
+import calendar
 from fastapi import FastAPI, Response, Request, Cookie
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, JSONResponse
@@ -19,10 +20,10 @@ from googleapiclient.http import MediaIoBaseDownload
 import io
 import base64
 
-from retrieval_service.google_api_utils import get_drive_public_download_link, get_gmail_attachment_download_link, initialize_user_data
-from retrieval_service.supabase_utils import get_user_by_email, create_user, update_user_status
-from retrieval_service.search_utils import combined_search, get_context_from_results
-from retrieval_service.openai_api_utils import chat_stream, summarize
+from retrieval_service import openai_api_utils
+from retrieval_service.agent import REACT_SYSTEM_PROMPT
+from retrieval_service.google_api_utils import initialize_user_data
+from retrieval_service.supabase_utils import get_user_by_email, create_user
 from fastapi.responses import StreamingResponse
 import json
 from retrieval_service.ocr_utils import init_model
@@ -421,150 +422,116 @@ async def logout(request: Request):
     response.delete_cookie("oauth_state")
     return response
 
-
 @app.post("/api/chat")
 async def chat(request: Request):
     """
-    Stream chat responses with RAG (Retrieval Augmented Generation).
-    Expects JSON: { "message": str, "history": [ {role: str, content: str}, ... ] }
+    Stream chat responses with either RAG mode (default) or ReAct agent mode.
+    
+    Request body:
+        - message: User's message
+        - history: Chat history
+        - mode: "rag" (default) or "agent"
     """
     credentials = get_credentials_from_cookies(request)
     if not credentials:
         return JSONResponse({"error": "Not authenticated"}, status_code=401)
-    
+
     try:
-        # Get user info (with caching)
         user_info = get_cached_user_info(credentials.token)
-        
         if not user_info:
-            # Cache miss - fetch from Google
             from googleapiclient.discovery import build
             service = build("oauth2", "v2", credentials=credentials)
             user_info = service.userinfo().get().execute()
-            
-            # Cache the result
             set_cached_user_info(credentials.token, user_info)
-        
+
         user_email = user_info.get("email")
-        
-        # Get user from database
         db_user = get_user_by_email(user_email)
         if not db_user or db_user.get("status") != "active":
             return JSONResponse({"error": "User not initialized"}, status_code=400)
-        
+
         user_id = db_user["uuid"]
-        
-        # Parse request body
+
         body = await request.json()
         user_message = body.get("message", "")
         history = body.get("history", [])
-        
+        mode = body.get("mode", "rag")  # Default to RAG mode
+
         if not user_message:
             return JSONResponse({"error": "No message provided"}, status_code=400)
-        
-        # Build search query
-        search_query = user_message
-        
-        # If there's history, summarize it as context
-        if history:
-            # Get last few messages for context
-            recent_history = history[-4:] if len(history) > 4 else history
-            history_text = "\n".join([f"{msg['role']}: {msg['content']}" for msg in recent_history])
-            try:
-                context_summary = summarize(history_text, max_chars=2000)
-                search_query = f"{context_summary}\n\nNew message: {user_message}"
-            except:
-                # If summarization fails, just use the user message
-                pass
-        
-        # Perform combined search (vector only, not keyword/fuzzy for chat)
-        # top_k is controlled by SEARCH_TOP_K environment variable
-        search_results = combined_search(
-            user_id=user_id,
-            query=search_query,
-            vector_weight=1.0,
-            keyword_weight=0.0,
-            fuzzy_weight=0.0
-        )
-        
-        # Get context and references from search results
-        context_str, references = get_context_from_results(user_id, search_results)
-        
-        # Get current date and time
-        from datetime import datetime
-        import calendar
+
         now = datetime.now()
         weekday_name = calendar.day_name[now.weekday()]
         current_datetime = now.strftime("%Y-%m-%d %H:%M:%S")
-        
-        # Build system message with context
+
+        # Build system message based on mode
+        if mode == "agent":
+            system_content = REACT_SYSTEM_PROMPT + (
+                f"\n\nCurrent date and time: {current_datetime} ({weekday_name}).\n"
+                f"User info JSON (for your reference, do NOT leak sensitive fields verbatim):\n{user_info}\n\n"
+                f"When you want to provide download links, use the format: [Title](URL)\n"
+                f"The download link can be obtained from the ids of attachments or drive files:\n"
+                f"- For Google Drive files, use http://localhost:8080/api/download/drive-direct/{{file_db_id}}\n"
+                f"- For Gmail attachments, use http://localhost:8080/api/download/attachment-direct/{{attachment_db_id}}\n"
+            )
+        else:
+            # RAG mode uses a simpler system prompt
+            system_content = (
+                f"You are a helpful assistant with access to the user's personal data.\n"
+                f"Current date and time: {current_datetime} ({weekday_name}).\n\n"
+                f"When you want to provide download links, use the format: [Title](URL)\n"
+                f"The download link can be obtained from the ids of attachments or drive files:\n"
+                f"- For Google Drive files, use http://localhost:8080/api/download/drive-direct/{{file_db_id}}\n"
+                f"- For Gmail attachments, use http://localhost:8080/api/download/attachment-direct/{{attachment_db_id}}\n"
+            )
+
         system_message = {
             "role": "system",
-            "content": (
-                f"You are a helpful assistant with access to the user's emails, calendar events, and files. "
-                f"Current date and time: {current_datetime} ({weekday_name}). "
-                f"Use the provided context to answer questions accurately. "
-                f"If the context doesn't contain relevant information, say so honestly."
-                f"User's info: \n{user_info}"
-                f"if you want to provide the download links to the user, use the following format: [Title](URL)"
-                f"The download link can be obtained from the ids of attachments or drive files:"
-                f" - For Google Drive files, use http:localhost:8080/api/download/drive-direct/{{file_db_id}}"
-                f" - For Gmail attachments, use http:localhost:8080/api/download/attachment-direct/{{attachment_db_id}}"
-            )
+            "content": system_content,
         }
-        
-        # Build user message with context
-        enhanced_user_message = user_message
-        if context_str:
-            enhanced_user_message = f"Context:\n{context_str}\n\n---\n\nUser question: {user_message}"
-        
-        # Build messages for chat
+
         messages = [system_message]
-        
-        # Add history (without context, as it's already in the enhanced message)
+
         for msg in history:
             messages.append({"role": msg["role"], "content": msg["content"]})
-        
-        # Add current enhanced user message
-        messages.append({"role": "user", "content": enhanced_user_message})
-        
-        # Stream response
+
+        messages.append({"role": "user", "content": user_message})
+
         async def generate():
             try:
-                # Stream chat response with immediate flushing
-                for chunk in chat_stream(messages):
-                    # Send chunk immediately
-                    data = f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
-                    yield data
-                    # Small delay to ensure chunks are sent individually
-                    await asyncio.sleep(0)
-                
-                # Send references at the end
-                if references:
-                    yield f"data: {json.dumps({'type': 'references', 'references': references})}\n\n"
-                
-                # Send done signal
-                yield f"data: {json.dumps({'type': 'done'})}\n\n"
-            
+                if mode == "agent":
+                    # Use ReAct agent with tool calling
+                    async for event in openai_api_utils.react_with_tools_stream(messages, user_id):
+                        yield "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
+                        await asyncio.sleep(0)
+                else:
+                    # Use direct RAG mode (default)
+                    async for event in openai_api_utils.rag_direct_stream(messages, user_id, user_message, user_info):
+                        yield "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
+                        await asyncio.sleep(0)
             except Exception as e:
-                yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
-        
+                import traceback
+                print(f"[CHAT ERROR] {e}")
+                print(traceback.format_exc())
+                err = {"type": "error", "error": str(e)}
+                yield "data: " + json.dumps(err, ensure_ascii=False) + "\n\n"
+
         return StreamingResponse(
-            generate(), 
+            generate(),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
-                "X-Accel-Buffering": "no"  # Disable nginx buffering
-            }
+                "X-Accel-Buffering": "no",
+            },
         )
-    
+
     except Exception as e:
         import traceback
         return JSONResponse(
             {"error": str(e), "traceback": traceback.format_exc()},
-            status_code=500
+            status_code=500,
         )
+
 
 @app.get("/api/download/drive-direct/{file_id}")
 async def download_drive_file_direct(file_id: str, request: Request):

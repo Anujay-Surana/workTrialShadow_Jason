@@ -1,4 +1,13 @@
-# Retrieval Service
+# 
+Simple Google OAuth authentication service with a FastAPI backend and a vanilla HTML/CSS/JavaScript frontend. Includes a full **user initialization flow** that fetches emails, schedules, files, and embeddings, with **parallel processing** and progress tracking.
+Retrieval Service - Dual Mode RAG/Agent System
+
+A powerful personal data retrieval system with Google OAuth authentication, featuring:
+- **RAG Mode (Default)**: Fast, reliable retrieval using combined semantic, keyword, and fuzzy search
+- **Agent Mode**: Smart ReAct agent with dynamic tool calling for complex queries
+- Full user initialization flow with parallel processing
+- Real-time streaming responses
+- Support for Gmail, Google Calendar, and Google Drive
 
 Simple Google OAuth authentication service with a FastAPI backend and a vanilla HTML/CSS/JavaScript frontend.
  Includes a full **user initialization flow** that fetches emails, schedules, files, and embeddings, with **parallel processing** and progress tracking.
@@ -223,6 +232,61 @@ Important tables:
 
 ------
 
+## Retrieval Modes
+
+The system supports two retrieval modes that can be toggled in the chat interface:
+
+### RAG Mode (Default) - Fast & Reliable
+
+**How it works:**
+1. **Contextualizes follow-up questions**: If you have conversation history, automatically rewrites questions with pronouns (like "tell me more about it") into standalone search queries
+2. Automatically performs combined search using:
+   - **Semantic/Vector Search**: Finds results based on meaning and context
+   - **Keyword Search**: Exact word matching for names, terms, etc.
+   - **Fuzzy Search**: Handles typos and approximate matches
+3. Deduplicates and ranks all results
+4. Builds context from top results
+5. Streams AI response with full context included
+
+**Best for:**
+- Quick queries about specific information
+- When you know what you're looking for
+- General questions about your data
+- Most everyday use cases
+
+**Advantages:**
+- Faster response time
+- More predictable results
+- Always searches your data
+- Lower token usage
+
+### Agent Mode - Smart & Adaptive
+
+**How it works:**
+1. AI analyzes your question using ReAct (Reason + Act) framework
+2. Decides which search tools to use (if any)
+3. Can make multiple tool calls with different strategies
+4. Refines search based on initial results
+5. Streams response with reasoning visible
+
+**Best for:**
+- Complex multi-step queries
+- When you need the AI to reason about what to search
+- Questions requiring multiple data sources
+- Exploratory searches
+
+**Advantages:**
+- Smarter search strategy selection
+- Can handle complex queries better
+- Shows its reasoning process
+- Adapts search based on findings
+
+### Switching Between Modes
+
+Toggle between modes using the buttons at the top of the chat interface:
+- **RAG (Fast)**: Default mode, always searches your data
+- **Agent (Smart)**: AI decides when and how to search
+
 ## API Endpoints
 
 - `GET /auth/google`
@@ -233,3 +297,4 @@ Important tables:
 - `GET /api/calendar`
 - `GET /api/drive`
 - `POST /api/auth/logout`
+- `POST /api/chat` (supports `mode` parameter: "rag" or "agent")
