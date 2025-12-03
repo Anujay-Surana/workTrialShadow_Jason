@@ -1,8 +1,15 @@
-# gemeni_api_utils.py
+"""
+Gemini API client for text embeddings.
+
+This module provides functions for generating text embeddings using Google's Gemini API.
+All embedding operations in the system should use this module.
+"""
 
 import os
+import time
 import google.generativeai as genai
 from dotenv import load_dotenv
+from retrieval_service.infrastructure.logging import log_debug, log_warning, log_error
 
 load_dotenv()
 
@@ -28,8 +35,7 @@ def embed_text(
     Returns:
         list: Embedding vector.
     """
-    import time
-    
+    # Standard Gemini embedding
     for attempt in range(max_retries):
         try:
             result = genai.embed_content(
@@ -46,11 +52,11 @@ def embed_text(
             if attempt < max_retries - 1 and is_retryable:
                 # Exponential backoff: 1s, 2s, 4s
                 wait_time = 1 * (2 ** attempt)
-                print(f"Gemini API error (attempt {attempt + 1}/{max_retries}): {e}. Retrying in {wait_time}s...")
+                log_warning(f"Gemini API error (attempt {attempt + 1}/{max_retries}): {e}. Retrying in {wait_time}s...")
                 time.sleep(wait_time)
             else:
                 # Non-retryable error or final attempt
-                print(f"Gemini API error after {max_retries} attempts: {e}")
+                log_error(f"Gemini API error after {max_retries} attempts: {e}")
                 raise
     
     raise Exception("Failed to embed text after all retries")

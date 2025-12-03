@@ -7,6 +7,7 @@ import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Any, List
 from dotenv import load_dotenv
+from .logging import log_debug, log_info, log_warning, log_error
 
 load_dotenv()
 
@@ -149,7 +150,7 @@ class GlobalThreadPoolManager:
                 result = process_func(item)
                 return idx, result
             except Exception as e:
-                print(f"Error processing item {idx}: {e}")
+                log_error(f"Error processing item {idx}: {e}")
                 import traceback
                 traceback.print_exc()
                 return idx, None
@@ -167,7 +168,7 @@ class GlobalThreadPoolManager:
                     idx, result = future.result()
                     results[idx] = result
                 except Exception as e:
-                    print(f"Error in future: {e}")
+                    log_error(f"Error in future: {e}")
                     import traceback
                     traceback.print_exc()
         

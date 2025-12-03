@@ -1,4 +1,5 @@
 import calendar
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Response, Request, Cookie
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, JSONResponse
@@ -9,7 +10,7 @@ import os
 from dotenv import load_dotenv
 import json
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import threading
 import asyncio
 from typing import Dict, Optional
@@ -20,22 +21,46 @@ from googleapiclient.http import MediaIoBaseDownload
 import io
 import base64
 
-from retrieval_service import openai_api_utils
-from retrieval_service.google_api_utils import initialize_user_data
-from retrieval_service.supabase_utils import get_user_by_email, create_user, delete_user_and_all_data
-from retrieval_service.ocr_utils import init_model
+from retrieval_service.api import openai_client
+from retrieval_service.data import get_user_by_email, create_user, delete_user_and_all_data, initialize_user_data
+from retrieval_service.processing import init_model
+from models import (
+    HealthResponse,
+    HealthStatusResponse,
+    MemoryRetrievalRequest,
+    MemoryRetrievalResponse,
+    AuthStatusResponse,
+    UserStatusResponse,
+    ErrorResponse,
+    SuccessResponse
+)
 
 load_dotenv()
 
 VERBOSE_OUTPUT = os.getenv("VERBOSE_OUTPUT", "false").lower() == "true"
 
-if VERBOSE_OUTPUT:
-    print("Loading OCR model...")
+print("Loading OCR model...")
 init_model(['en'])
-if VERBOSE_OUTPUT:
-    print("OCR model loaded.")
+print("OCR model loaded.")
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan event handler for startup and shutdown"""
+    # Startup
+    from retrieval_service.infrastructure.monitoring import monitor
+    monitor.log_event("SERVICE_START", "Service started")
+    yield
+    # Shutdown
+    monitor.log_event("SERVICE_SHUTDOWN", "Service shutting down")
+
+app = FastAPI(
+    title="Memory Retrieval API",
+    description="A backend memory retrieval service that provides context summaries from personal data (Gmail, Google Calendar, Google Drive)",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    lifespan=lifespan
+)
 
 # User info cache to reduce Google API calls
 # Structure: {token_hash: {"user_info": {...}, "expires_at": timestamp}}
@@ -121,14 +146,71 @@ def get_flow():
     )
 
 
-@app.get("/")
-async def root():
-    return {"message": "Retrieval Service API"}
+@app.get(
+    "/health",
+    response_model=HealthResponse,
+    summary="Simple Health Check",
+    description="Quick ping endpoint to check if the service is running. Suitable for load balancers and monitoring systems.",
+    tags=["Health"]
+)
+async def health():
+    """Simple health check ping"""
+    return {"status": "ok"}
 
 
-@app.get("/auth/google")
+@app.get(
+    "/health/status",
+    response_model=HealthStatusResponse,
+    summary="Detailed Health Status",
+    description="Get detailed service status including rate limit monitoring, API usage statistics, and risk assessment.",
+    tags=["Health"]
+)
+async def health_status():
+    """Detailed health status with rate limit monitoring"""
+    from retrieval_service.infrastructure.monitoring import monitor
+    
+    # Get stats for different time ranges
+    stats = {
+        '10min': monitor.get_stats('10min'),
+        '1hour': monitor.get_stats('1hour'),
+        '1day': monitor.get_stats('1day'),
+        '1week': monitor.get_stats('1week'),
+        '1month': monitor.get_stats('1month'),
+        '1year': monitor.get_stats('1year')
+    }
+    
+    # Get timeline data for graphing
+    timeline = {
+        '10min': monitor.get_timeline_data('10min', 10),
+        '1hour': monitor.get_timeline_data('1hour', 20),
+        '1day': monitor.get_timeline_data('1day', 24)
+    }
+    
+    # Calculate risk level
+    risk_level, risk_reason = monitor.calculate_risk_level()
+    
+    return {
+        "message": "Memory Retrieval Service API",
+        "status": "operational",
+        "monitoring": {
+            "risk_level": risk_level,
+            "risk_reason": risk_reason,
+            "stats": stats,
+            "timeline": timeline
+        }
+    }
+
+
+@app.get(
+    "/auth/google",
+    summary="Initiate Google OAuth",
+    description="Start the Google OAuth 2.0 flow to authenticate and authorize access to Gmail, Calendar, and Drive.",
+    tags=["Authentication"]
+)
 async def google_auth():
     """Initiate Google OAuth flow"""
+    from retrieval_service.infrastructure.monitoring import monitor
+    
     flow = get_flow()
     authorization_url, state = flow.authorization_url(
         access_type="offline",
@@ -137,6 +219,8 @@ async def google_auth():
     )
     response = RedirectResponse(url=authorization_url)
     response.set_cookie(key="oauth_state", value=state, httponly=True, samesite="lax")
+    
+    monitor.log_request('api', 'auth_google_init', 'success', 0)
     return response
 
 
@@ -154,7 +238,12 @@ def run_initialization_in_background(user_id: str, credentials, debug_mode: bool
     thread.start()
 
 
-@app.get("/auth/google/callback")
+@app.get(
+    "/auth/google/callback",
+    summary="OAuth Callback",
+    description="Handle the OAuth callback from Google. This endpoint is called automatically by Google after user authorization.",
+    tags=["Authentication"]
+)
 async def google_callback(request: Request, code: str = None, state: str = None):
     """Handle Google OAuth callback"""
     try:
@@ -221,7 +310,9 @@ async def google_callback(request: Request, code: str = None, state: str = None)
                 scopes=returned_scopes,
             )
             if "expires_in" in token_info:
-                credentials.expiry = datetime.utcnow() + timedelta(seconds=token_info["expires_in"])
+                # Use naive datetime to match Google's internal implementation
+                from datetime import datetime as dt
+                credentials.expiry = dt.utcnow() + timedelta(seconds=token_info["expires_in"])
         except Exception as token_error:
             import traceback
             return JSONResponse(
@@ -243,6 +334,11 @@ async def google_callback(request: Request, code: str = None, state: str = None)
             user_email = user_info.get("email")
             user_name = user_info.get("name")
             
+            # Check DEBUG_MODE environment variable
+            debug_mode = os.getenv("DEBUG_MODE", "false").lower() == "true"
+            if debug_mode:
+                print("[DEBUG MODE ENABLED] Will process only latest 50 files")
+            
             # Check if user exists in database
             existing_user = get_user_by_email(user_email)
             
@@ -250,25 +346,23 @@ async def google_callback(request: Request, code: str = None, state: str = None)
                 # Create new user
                 new_user = create_user(user_email, user_name)
                 if new_user:
-                    # Check DEBUG_MODE environment variable
-                    debug_mode = os.getenv("DEBUG_MODE", "false").lower() == "true"
-                    if debug_mode:
-                        print("[DEBUG MODE ENABLED] Will process only latest 50 files")
-                    
                     # Start initialization in background thread
                     run_initialization_in_background(new_user["uuid"], credentials, debug_mode=debug_mode)
-            if existing_user.get("init_phase") == "failed":
-                delete_user_and_all_data(existing_user.get("uuid"))
+            elif existing_user.get("init_phase") == "failed":
+                # Previous initialization failed, delete and restart
+                print(f"[DEBUG MODE ENABLED] Previous init failed for {user_email}, restarting")
+                user_id = existing_user.get("uuid")
+                delete_user_and_all_data(user_id)
+                
+                # Recreate user
+                new_user = create_user(user_email, user_name)
                 if new_user:
-                    # Check DEBUG_MODE environment variable
-                    debug_mode = os.getenv("DEBUG_MODE", "false").lower() == "true"
-                    if debug_mode:
-                        print("[DEBUG MODE ENABLED] Previous init failed, restarting, Will process only latest 50 files")
-                    
                     # Start initialization in background thread
                     run_initialization_in_background(new_user["uuid"], credentials, debug_mode=debug_mode)
         except Exception as e:
+            import traceback
             print(f"Error checking/creating user: {e}")
+            traceback.print_exc()
 
         # Store tokens in HTTP-only cookie
         response = RedirectResponse(url="http://localhost:3000/?auth=success")
@@ -337,7 +431,16 @@ def get_credentials_from_cookies(request: Request) -> Credentials | None:
     return credentials
 
 
-@app.get("/api/profile")
+@app.get(
+    "/api/profile",
+    responses={
+        200: {"description": "User profile information"},
+        401: {"model": ErrorResponse, "description": "Not authenticated"}
+    },
+    summary="Get User Profile",
+    description="Get authenticated user's profile information from Google (name, email, picture). Results are cached for 60 seconds.",
+    tags=["User"]
+)
 async def get_profile(request: Request):
     """Get user profile using stored access token (with caching)"""
     credentials = get_credentials_from_cookies(request)
@@ -363,7 +466,17 @@ async def get_profile(request: Request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
-@app.get("/api/auth/status")
+@app.get(
+    "/api/auth/status",
+    response_model=AuthStatusResponse,
+    responses={
+        200: {"description": "Authentication status retrieved"},
+        401: {"model": ErrorResponse, "description": "Not authenticated"}
+    },
+    summary="Check Auth Status",
+    description="Check if user is authenticated and get initialization progress. Returns user info and initialization status (processing/active/error).",
+    tags=["Authentication"]
+)
 async def auth_status(request: Request):
     """Check authentication status and initialization progress (with caching)"""
     credentials = get_credentials_from_cookies(request)
@@ -396,7 +509,7 @@ async def auth_status(request: Request):
             else:
                 # User authenticated but not in database yet
                 return {
-                    "authenticated": True,
+                    "authenticated": False,
                     "user": user_info,
                     "status": "pending",
                     "init_phase": "not_started",
@@ -407,7 +520,17 @@ async def auth_status(request: Request):
     return {"authenticated": False}
 
 
-@app.post("/api/auth/logout")
+@app.post(
+    "/api/auth/logout",
+    response_model=SuccessResponse,
+    responses={
+        200: {"description": "Successfully logged out"},
+        401: {"model": ErrorResponse, "description": "Not authenticated"}
+    },
+    summary="Logout",
+    description="Logout user, revoke OAuth token, clear cache, and remove cookies.",
+    tags=["Authentication"]
+)
 async def logout(request: Request):
     """Logout, revoke token, clear cache, and clear cookies"""
     credentials = get_credentials_from_cookies(request)
@@ -434,22 +557,105 @@ async def logout(request: Request):
     response.delete_cookie("oauth_state")
     return response
 
-@app.post("/api/memory/retrieval")
+@app.delete(
+    "/api/auth/account",
+    response_model=SuccessResponse,
+    responses={
+        200: {"description": "Account deleted successfully"},
+        401: {"model": ErrorResponse, "description": "Not authenticated"},
+        500: {"model": ErrorResponse, "description": "Failed to delete account"}
+    },
+    summary="Delete Account",
+    description="Permanently delete user account and all associated data (emails, schedules, files, attachments, embeddings). This action cannot be undone.",
+    tags=["Authentication"]
+)
+async def delete_account(request: Request):
+    """Delete user account and all associated data"""
+    credentials = get_credentials_from_cookies(request)
+    
+    if not credentials:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+    
+    try:
+        # Get user info
+        user_info = get_cached_user_info(credentials.token)
+        if not user_info:
+            from googleapiclient.discovery import build
+            service = build("oauth2", "v2", credentials=credentials)
+            user_info = service.userinfo().get().execute()
+        
+        user_email = user_info.get("email")
+        db_user = get_user_by_email(user_email)
+        
+        if not db_user:
+            return JSONResponse({"error": "User not found in database"}, status_code=404)
+        
+        user_id = db_user.get("uuid")
+        
+        # Delete all user data
+        success = delete_user_and_all_data(user_id)
+        
+        if not success:
+            return JSONResponse({"error": "Failed to delete account data"}, status_code=500)
+        
+        # Clear cache
+        clear_cached_user_info(credentials.token)
+        
+        # Revoke OAuth token
+        try:
+            revoke_url = "https://oauth2.googleapis.com/revoke"
+            revoke_data = {"token": credentials.token}
+            requests.post(revoke_url, data=revoke_data)
+        except Exception as e:
+            print(f"Failed to revoke token: {e}")
+        
+        # Clear cookies
+        response = JSONResponse({"message": "Account deleted successfully"})
+        response.delete_cookie("access_token")
+        response.delete_cookie("refresh_token")
+        response.delete_cookie("token_expiry")
+        response.delete_cookie("oauth_state")
+        
+        return response
+        
+    except Exception as e:
+        print(f"Error deleting account: {e}")
+        import traceback
+        traceback.print_exc()
+        return JSONResponse({"error": f"Failed to delete account: {str(e)}"}, status_code=500)
+
+
+@app.post(
+    "/api/memory/retrieval",
+    response_model=MemoryRetrievalResponse,
+    responses={
+        200: {"description": "Successful retrieval with context and references"},
+        401: {"model": ErrorResponse, "description": "Not authenticated"},
+        500: {"model": ErrorResponse, "description": "Internal server error"}
+    },
+    summary="Memory Retrieval",
+    description="""
+Query user's personal data (Gmail, Google Calendar, Google Drive) and get context summaries with references.
+
+**Retrieval Modes:**
+- `rag` (default): Fast, reliable context extraction using combined search
+- `mixed`: RAG with optional AI tool calling for complex queries
+- `react`: Full reasoning loop with dynamic search strategies
+
+**Response Format:**
+- Third-person perspective (e.g., "User has 2 emails about...")
+- Complete reference data with full database rows
+- AI-selected relevant sources only
+    """,
+    tags=["Memory Retrieval"]
+)
 async def memory_retrieval(request: Request):
-    """
-    Memory retrieval endpoint - one-time query against user's personal data.
+    """Memory retrieval endpoint - query user's personal data"""
+    from retrieval_service.infrastructure.monitoring import monitor
     
-    Request body:
-        - query: Search query (required)
-        - mode: "rag" | "mixed" | "react" (optional, default: "rag")
-    
-    Response:
-        - content: Generated response text
-        - references: List of source references
-        - process: Processing steps (only if VERBOSE_OUTPUT=true)
-    """
     credentials = get_credentials_from_cookies(request)
     if not credentials:
+        monitor.log_request('api', 'memory_retrieval', 'error_auth', 0)
         return JSONResponse({"error": "Not authenticated"}, status_code=401)
 
     try:
@@ -478,59 +684,71 @@ async def memory_retrieval(request: Request):
         weekday_name = calendar.day_name[now.weekday()]
         current_datetime = now.strftime("%Y-%m-%d %H:%M:%S")
 
-        system_content = (
-            f"You are a memory retrieval module that extracts factual context from user data.\n"
-            f"Current date and time: {current_datetime} ({weekday_name}).\n"
-            f"User: {user_info.get('name')} ({user_info.get('email')})\n\n"
-            f"CRITICAL INSTRUCTIONS:\n"
-            f"1. Write in THIRD-PERSON perspective (describe what exists in the data)\n"
-            f"2. Do NOT use first-person ('I found', 'I see') - use third-person ('User has', 'Data contains', 'Records show')\n"
-            f"3. Keep responses SHORT - maximum 3-4 sentences or bullet points\n"
-            f"4. Extract ONLY factual information, no opinions or advice\n"
-            f"5. Focus on: dates, people, actions, deadlines, key facts\n"
-            f"6. If no relevant data exists, state it objectively\n\n"
-            f"OUTPUT FORMAT:\n"
-            f"First line: Objective summary of what data exists\n"
-            f"Following lines: Key facts in bullet points (if multiple)\n"
-            f"Last line: REFERENCE_IDS: [comma-separated list of source IDs]\n\n"
-            f"CORRECT EXAMPLES:\n"
-            f"✓ 'User has 2 emails about project deadline from Sarah.'\n"
-            f"✓ 'Data contains meeting scheduled for Dec 5, 2PM.'\n"
-            f"✓ 'Records show budget proposal due Dec 3.'\n"
-            f"✓ 'No relevant information exists in user data.'\n\n"
-            f"INCORRECT EXAMPLES:\n"
-            f"✗ 'I found 2 emails about project deadline.'\n"
-            f"✗ 'I see you have a meeting on Dec 5.'\n"
-            f"✗ 'Let me help you with that.'\n"
-            f"✗ 'Here's what I discovered...'\n\n"
-            f"Example output:\n"
-            f"User has 2 emails about project deadline from Sarah.\n"
-            f"- Meeting scheduled Dec 5, 2PM with Sarah\n"
-            f"- Budget proposal due Dec 3\n"
-            f"REFERENCE_IDS: email_123, email_456, event_789\n\n"
-            f"If no data found:\n"
-            f"No relevant information exists in user's personal data.\n"
-            f"REFERENCE_IDS: none\n"
-        )
+        # Build system prompt based on mode
+        if mode == "react":
+            # ReAct mode: use tool-calling prompt (no REFERENCE_IDS required)
+            from retrieval_service.core import REACT_SYSTEM_PROMPT
+            system_content = (
+                f"Current date and time: {current_datetime} ({weekday_name}).\n"
+                f"User: {user_info.get('name')} ({user_info.get('email')})\n\n"
+                f"{REACT_SYSTEM_PROMPT}"
+            )
+            user_prompt = f"Query: {query}"
+        else:
+            # For RAG mode: use direct retrieval prompt with REFERENCE_IDS format
+            system_content = (
+                f"You are a memory retrieval module that extracts factual context from user data.\n"
+                f"Current date and time: {current_datetime} ({weekday_name}).\n"
+                f"User: {user_info.get('name')} ({user_info.get('email')})\n\n"
+                f"CRITICAL INSTRUCTIONS:\n"
+                f"1. Write in THIRD-PERSON perspective (describe what exists in the data)\n"
+                f"2. Do NOT use first-person ('I found', 'I see') - use third-person ('User has', 'Data contains', 'Records show')\n"
+                f"3. Keep responses SHORT - maximum 3-4 sentences or bullet points\n"
+                f"4. Extract ONLY factual information, no opinions or advice\n"
+                f"5. Focus on: dates, people, actions, deadlines, key facts\n"
+                f"6. If no relevant data exists, state it objectively\n\n"
+                f"OUTPUT FORMAT:\n"
+                f"First line: Objective summary of what data exists\n"
+                f"Following lines: Key facts in bullet points (if multiple)\n"
+                f"Last line: REFERENCE_IDS: [comma-separated list of source IDs]\n\n"
+                f"CORRECT EXAMPLES:\n"
+                f"✓ 'User has 2 emails about project deadline from Sarah.'\n"
+                f"✓ 'Data contains meeting scheduled for Dec 5, 2PM.'\n"
+                f"✓ 'Records show budget proposal due Dec 3.'\n"
+                f"✓ 'No relevant information exists in user data.'\n\n"
+                f"INCORRECT EXAMPLES:\n"
+                f"✗ 'I found 2 emails about project deadline.'\n"
+                f"✗ 'I see you have a meeting on Dec 5.'\n"
+                f"✗ 'Let me help you with that.'\n"
+                f"✗ 'Here's what I discovered...'\n\n"
+                f"Example output:\n"
+                f"User has 2 emails about project deadline from Sarah.\n"
+                f"- Meeting scheduled Dec 5, 2PM with Sarah\n"
+                f"- Budget proposal due Dec 3\n"
+                f"REFERENCE_IDS: email_123, email_456, event_789\n\n"
+                f"If no data found:\n"
+                f"No relevant information exists in user's personal data.\n"
+                f"REFERENCE_IDS: none\n"
+            )
+            user_prompt = f"Query: {query}\n\nExtract factual context in third-person perspective with relevant REFERENCE_IDS."
 
         system_message = {"role": "system", "content": system_content}
-        
-        user_prompt = f"Query: {query}\n\nExtract factual context in third-person perspective with relevant REFERENCE_IDS."
-        
         messages = [system_message, {"role": "user", "content": user_prompt}]
 
         if mode == "react":
-            from retrieval_service import react_agent_utils
-            result = await react_agent_utils.react_agent_direct(messages, user_id)
+            from retrieval_service.core import react_agent_direct
+            result = await react_agent_direct(messages, user_id)
         elif mode == "mixed":
-            result = await openai_api_utils.react_with_tools_direct(messages, user_id)
+            result = await openai_client.react_with_tools_direct(messages, user_id)
         else:
-            result = await openai_api_utils.rag_direct(messages, user_id, query, user_info)
+            result = await openai_client.rag_direct(messages, user_id, query, user_info)
 
+        monitor.log_request('api', f'memory_retrieval_{mode}', 'success', 0)
         return JSONResponse(result)
 
     except Exception as e:
         import traceback
+        monitor.log_request('api', f'memory_retrieval_{mode}', 'error', 0)
         if VERBOSE_OUTPUT:
             print(f"[RETRIEVAL ERROR] {e}")
             print(traceback.format_exc())
@@ -540,12 +758,30 @@ async def memory_retrieval(request: Request):
         )
 
 
-@app.get("/api/download/drive-direct/{file_id}")
+@app.get(
+    "/api/download/drive-direct/{file_id}",
+    responses={
+        200: {"description": "File download stream"},
+        401: {"model": ErrorResponse, "description": "Not authenticated"},
+        404: {"model": ErrorResponse, "description": "File not found"},
+        500: {"model": ErrorResponse, "description": "Download failed"}
+    },
+    summary="Download Drive File",
+    description="""
+Download a Google Drive file using user's OAuth credentials.
+
+Supports:
+- Google Docs (exported as .docx)
+- Google Sheets (exported as .xlsx)
+- Google Slides (exported as .pptx)
+- Binary files (PDFs, images, etc.)
+
+Returns a streaming response with appropriate content type and filename.
+    """,
+    tags=["Downloads"]
+)
 async def download_drive_file_direct(file_id: str, request: Request):
-    """
-    Server-side Google Drive download using user OAuth
-    Works for Google Docs, Sheets, Slides, binary files.
-    """
+    """Server-side Google Drive download using user OAuth"""
     credentials = get_credentials_from_cookies(request)
     if not credentials:
         return JSONResponse({"error": "Not authenticated"}, status_code=401)
@@ -603,7 +839,22 @@ async def download_drive_file_direct(file_id: str, request: Request):
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
-@app.get("/api/download/attachment-direct/{attachment_id}")
+@app.get(
+    "/api/download/attachment-direct/{attachment_id}",
+    responses={
+        200: {"description": "Attachment download stream"},
+        401: {"model": ErrorResponse, "description": "Not authenticated"},
+        404: {"model": ErrorResponse, "description": "Attachment not found"},
+        500: {"model": ErrorResponse, "description": "Download failed"}
+    },
+    summary="Download Email Attachment",
+    description="""
+Download an email attachment using user's OAuth credentials.
+
+The attachment is fetched from Gmail and streamed to the client with appropriate content type and filename.
+    """,
+    tags=["Downloads"]
+)
 async def download_attachment_direct(attachment_id: str, request: Request):
     """
     Server-side Gmail attachment download.
@@ -615,7 +866,7 @@ async def download_attachment_direct(attachment_id: str, request: Request):
 
     try:
         # 1. Look up attachment metadata in DB
-        from retrieval_service.supabase_utils import supabase
+        from retrieval_service.data import supabase
         resp = supabase.table("attachments").select("*").eq("id", attachment_id).execute()
 
         if not resp.data:

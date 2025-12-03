@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sign In - Retrieval Service</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <!-- Main Content -->
+    <div class="container">
+        <!-- Sign In Section -->
+        <div id="signInSection" class="sign-in-section">
+            <button id="googleSignInBtn" class="google-sign-in-btn">
+                Sign in with Google
+            </button>
+        </div>
+    </div>
+
+    <!-- Success Notification Modal (Bottom Right) -->
+    <div id="successModal" class="success-modal hidden">
+        <div class="success-content">
+            Google connected successfully
+        </div>
+    </div>
+
+    <script>
+        const API_BASE_URL = 'http://localhost:8080';
+
+        // Check authentication status on page load
+        async function checkAuthStatus() {
+            try {
+                const response = await fetch(`${API_BASE_URL}/api/auth/status`, {
+                    credentials: 'include'
+                });
+                const data = await response.json();
+                
+                if (data.authenticated && data.user) {
+                    // Check initialization status
+                    if (data.status === 'pending' || data.status === 'processing') {
+                        window.location.href = '/onboarding.html';
+                    } else if (data.status === 'active') {
+                        window.location.href = '/index.html';
+                    }
+                }
+            } catch (error) {
+                console.error('Error checking auth status:', error);
+            }
+        }
+
+        // Handle Google Sign-In button click
+        function handleGoogleSignIn() {
+            window.location.href = `${API_BASE_URL}/auth/google`;
+        }
+
+        // Show success notification
+        function showSuccessNotification() {
+            const modal = document.getElementById('successModal');
+            modal.classList.remove('hidden');
+            
+            setTimeout(() => {
+                modal.classList.add('hidden');
+            }, 3000);
+        }
+
+        // Check if redirected from OAuth callback
+        function checkOAuthCallback() {
+            const urlParams = new URLSearchParams(window.location.search);
+            if (urlParams.get('auth') === 'success') {
+                showSuccessNotification();
+                window.history.replaceState({}, document.title, window.location.pathname);
+                checkAuthStatus();
+            }
+        }
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', () => {
+            document.getElementById('googleSignInBtn').addEventListener('click', handleGoogleSignIn);
+            checkOAuthCallback();
+            checkAuthStatus();
+        });
+    </script>
+</body>
+</html>

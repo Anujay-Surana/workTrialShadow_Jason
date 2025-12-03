@@ -1,6 +1,7 @@
 # Environment variables
 .env
 .env.local
+.env.production
 
 # Python
 __pycache__/
@@ -24,6 +25,7 @@ wheels/
 .installed.cfg
 *.egg
 venv/
+.venv/
 ENV/
 env/
 
@@ -34,9 +36,12 @@ env/
 *.swo
 *~
 .DS_Store
+.kiro/
 
 # Logs
 *.log
+logs/
+backend/logs/
 
 # Database
 *.db
@@ -46,7 +51,19 @@ env/
 .pytest_cache/
 .coverage
 htmlcov/
+.hypothesis/
 
 # Node (if any)
 node_modules/
 package-lock.json
+
+# OS
+Thumbs.db
+.Spotlight-V100
+.Trashes
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+*~.nib

@@ -22,7 +22,14 @@ dependencies = [
     "openpyxl>=3.1.5",
     "mammoth>=1.11.0",
     "xlrd>=2.0.2",
-    "rapidfuzz>=3.14.3"
+    "rapidfuzz>=3.14.3",
+    "tenacity>=9.1.2"
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.4.0",
+    "hypothesis>=6.92.0"
 ]
 
 [build-system]

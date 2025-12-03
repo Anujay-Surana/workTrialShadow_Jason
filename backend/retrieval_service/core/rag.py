@@ -1,12 +1,23 @@
+"""
+RAG (Retrieval-Augmented Generation) utilities.
+
+This module provides the core RAG retrieval functionality, including combined search
+across multiple strategies (semantic, keyword, fuzzy) and prompt building for
+context extraction.
+"""
+
 from typing import Dict, List, Tuple
-from retrieval_service.search_utils import (
+from retrieval_service.search import (
     vector_search,
     keyword_search,
     fuzzy_search,
-    get_context_from_results,
-    DEFAULT_TOP_K
+    get_context_from_results
 )
-from retrieval_service.gemni_api_utils import embed_text
+from retrieval_service.api.gemini_client import embed_text
+from retrieval_service.infrastructure.logging import log_debug, log_info, log_error
+import os
+
+DEFAULT_TOP_K = int(os.getenv("SEARCH_TOP_K", "5"))
 
 
 def deduplicate_results(results: List[Dict]) -> List[Dict]:
@@ -51,7 +62,7 @@ def combined_search(
     # 1. Semantic/Vector Search (best for meaning-based queries)
     if use_semantic:
         try:
-            print(f"[RAG] Performing semantic search for: {query}")
+            log_info(f"[RAG] Performing semantic search for: {query}")
             embedding = embed_text(query)
             semantic_results = vector_search(
                 user_id=user_id,
@@ -60,14 +71,14 @@ def combined_search(
                 top_k=top_k
             )
             all_results.extend(semantic_results)
-            print(f"[RAG] Semantic search found {len(semantic_results)} results")
+            log_info(f"[RAG] Semantic search found {len(semantic_results)} results")
         except Exception as e:
-            print(f"[RAG] Error in semantic search: {e}")
+            log_error(f"[RAG] Error in semantic search: {e}")
     
     # 2. Keyword Search (best for exact words/names)
     if use_keyword:
         try:
-            print(f"[RAG] Performing keyword search for: {query}")
+            log_info(f"[RAG] Performing keyword search for: {query}")
             # Extract keywords from query (simple word splitting)
             keywords = [word for word in query.split() if len(word) > 2]
             if keywords:
@@ -77,23 +88,23 @@ def combined_search(
                     top_k=top_k
                 )
                 all_results.extend(keyword_results)
-                print(f"[RAG] Keyword search found {len(keyword_results)} results")
+                log_info(f"[RAG] Keyword search found {len(keyword_results)} results")
         except Exception as e:
-            print(f"[RAG] Error in keyword search: {e}")
+            log_error(f"[RAG] Error in keyword search: {e}")
     
     # 3. Fuzzy Search (best for approximate matches)
     if use_fuzzy:
         try:
-            print(f"[RAG] Performing fuzzy search for: {query}")
+            log_info(f"[RAG] Performing fuzzy search for: {query}")
             fuzzy_results = fuzzy_search(
                 user_id=user_id,
                 query=query,
                 top_k=top_k
             )
             all_results.extend(fuzzy_results)
-            print(f"[RAG] Fuzzy search found {len(fuzzy_results)} results")
+            log_info(f"[RAG] Fuzzy search found {len(fuzzy_results)} results")
         except Exception as e:
-            print(f"[RAG] Error in fuzzy search: {e}")
+            log_error(f"[RAG] Error in fuzzy search: {e}")
     
     # Deduplicate and sort by score
     unique_results = deduplicate_results(all_results)
@@ -102,7 +113,7 @@ def combined_search(
     # Limit to top_k total results
     final_results = sorted_results[:top_k * 2]  # Allow more results for better context
     
-    print(f"[RAG] Total unique results: {len(final_results)}")
+    log_info(f"[RAG] Total unique results: {len(final_results)}")
     
     # Get full context and references
     context, references = get_context_from_results(user_id, final_results)

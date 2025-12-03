@@ -1,6 +1,17 @@
+"""
+Database operations for Supabase.
+
+This module provides all database operations for the Memory Retrieval Service,
+including user management, email/schedule/file storage, and embedding management.
+All operations use the Supabase client with proper error handling and logging.
+"""
+
 import os
+import time
+from functools import wraps
 from supabase import create_client, Client
 from dotenv import load_dotenv
+from ..infrastructure.logging import log_debug, log_info, log_warning, log_error
 
 load_dotenv()
 
@@ -12,49 +23,78 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 # ======================================================
+# Retry Decorator for Database Operations
+# ======================================================
+
+def retry_on_disconnect(max_retries=3, backoff_factor=2):
+    """
+    Decorator to retry database operations on connection errors.
+    
+    Args:
+        max_retries: Maximum number of retry attempts
+        backoff_factor: Multiplier for exponential backoff (seconds)
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    error_str = str(e).lower()
+                    is_retryable = any(keyword in error_str for keyword in [
+                        'server disconnected', 'connection', 'timeout',
+                        'temporarily unavailable', '503', '504', '429'
+                    ])
+                    
+                    if attempt < max_retries - 1 and is_retryable:
+                        wait_time = backoff_factor * (2 ** attempt)
+                        log_warning(f"{func.__name__} failed (attempt {attempt + 1}/{max_retries}): {e}. Retrying in {wait_time}s...")
+                        time.sleep(wait_time)
+                    else:
+                        # Last attempt or non-retryable error
+                        log_error(f"{func.__name__} failed after {max_retries} attempts: {e}")
+                        raise
+            return None
+        return wrapper
+    return decorator
+
+
+# ======================================================
 # User Management
 # ======================================================
 
+@retry_on_disconnect(max_retries=3, backoff_factor=2)
 def get_user_by_email(email: str):
-    """Get user by email"""
-    try:
-        response = supabase.table("users").select("*").eq("email", email).execute()
-        return response.data[0] if response.data else None
-    except Exception as e:
-        print(f"Error getting user by email: {e}")
-        return None
+    """Get user by email with automatic retry on connection errors"""
+    response = supabase.table("users").select("*").eq("email", email).execute()
+    return response.data[0] if response.data else None
 
 
+@retry_on_disconnect(max_retries=3, backoff_factor=2)
 def create_user(email: str, name: str = None):
-    """Create a new user with pending status"""
-    try:
-        response = supabase.table("users").insert({
-            "email": email,
-            "name": name,
-            "status": "pending",
-            "init_phase": "not_started",
-            "init_progress": 0
-        }).execute()
-        return response.data[0] if response.data else None
-    except Exception as e:
-        print(f"Error creating user: {e}")
-        return None
+    """Create a new user with pending status, with automatic retry on connection errors"""
+    response = supabase.table("users").insert({
+        "email": email,
+        "name": name,
+        "status": "pending",
+        "init_phase": "not_started",
+        "init_progress": 0
+    }).execute()
+    return response.data[0] if response.data else None
 
 
+@retry_on_disconnect(max_retries=3, backoff_factor=2)
 def update_user_status(user_id: str, status: str, init_phase: str = None, init_progress: int = None):
-    """Update user initialization status"""
-    try:
-        update_data = {"status": status}
-        if init_phase is not None:
-            update_data["init_phase"] = init_phase
-        if init_progress is not None:
-            update_data["init_progress"] = init_progress
-        
-        response = supabase.table("users").update(update_data).eq("uuid", user_id).execute()
-        return response.data[0] if response.data else None
-    except Exception as e:
-        print(f"Error updating user status: {e}")
-        return None
+    """Update user initialization status with automatic retry on connection errors"""
+    update_data = {"status": status}
+    if init_phase is not None:
+        update_data["init_phase"] = init_phase
+    if init_progress is not None:
+        update_data["init_progress"] = init_progress
+    
+    response = supabase.table("users").update(update_data).eq("uuid", user_id).execute()
+    return response.data[0] if response.data else None
 
 
 # ======================================================
@@ -87,7 +127,7 @@ def insert_emails(user_id: str, emails: list):
         response = supabase.table("emails").upsert(records).execute()
         return response.data
     except Exception as e:
-        print(f"Error inserting emails: {e}")
+        log_error(f"Error inserting emails: {e}")
         return []
 
 
@@ -103,10 +143,10 @@ def get_emails_by_thread(user_id: str, thread_id: str, max_retries: int = 3):
             if attempt < max_retries - 1:
                 # Exponential backoff: 0.5s, 1s, 2s
                 wait_time = 0.5 * (2 ** attempt)
-                print(f"Error getting emails by thread (attempt {attempt + 1}/{max_retries}): {e}. Retrying in {wait_time}s...")
+                log_warning(f"Error getting emails by thread (attempt {attempt + 1}/{max_retries}): {e}. Retrying in {wait_time}s...")
                 time.sleep(wait_time)
             else:
-                print(f"Error getting emails by thread after {max_retries} attempts: {e}")
+                log_error(f"Error getting emails by thread after {max_retries} attempts: {e}")
                 return []
     return []
 
@@ -148,7 +188,7 @@ def insert_schedules(user_id: str, schedules: list):
         response = supabase.table("schedules").upsert(records).execute()
         return response.data
     except Exception as e:
-        print(f"Error inserting schedules: {e}")
+        log_error(f"Error inserting schedules: {e}")
         return []
 
 
@@ -184,7 +224,7 @@ def insert_files(user_id: str, files: list):
         response = supabase.table("files").upsert(records).execute()
         return response.data
     except Exception as e:
-        print(f"Error inserting files: {e}")
+        log_error(f"Error inserting files: {e}")
         return []
 
 
@@ -194,7 +234,7 @@ def update_file_summary(user_id: str, file_id: str, summary: str):
         response = supabase.table("files").update({"summary": summary}).eq("user_id", user_id).eq("id", file_id).execute()
         return response.data[0] if response.data else None
     except Exception as e:
-        print(f"Error updating file summary: {e}")
+        log_error(f"Error updating file summary: {e}")
         return None
 
 
@@ -225,7 +265,7 @@ def insert_attachments(user_id: str, attachments: list):
         response = supabase.table("attachments").upsert(records).execute()
         return response.data
     except Exception as e:
-        print(f"Error inserting attachments: {e}")
+        log_error(f"Error inserting attachments: {e}")
         return []
 
 
@@ -235,18 +275,15 @@ def update_attachment_summary(user_id: str, attachment_id: str, summary: str):
         response = supabase.table("attachments").update({"summary": summary}).eq("user_id", user_id).eq("id", attachment_id).execute()
         return response.data[0] if response.data else None
     except Exception as e:
-        print(f"Error updating attachment summary: {e}")
+        log_error(f"Error updating attachment summary: {e}")
         return None
 
 
+@retry_on_disconnect(max_retries=3, backoff_factor=2)
 def get_attachments_by_email(user_id: str, email_id: str):
-    """Get all attachments for an email"""
-    try:
-        response = supabase.table("attachments").select("*").eq("user_id", user_id).eq("email_id", email_id).execute()
-        return response.data
-    except Exception as e:
-        print(f"Error getting attachments by email: {e}")
-        return []
+    """Get all attachments for an email with automatic retry on connection errors"""
+    response = supabase.table("attachments").select("*").eq("user_id", user_id).eq("email_id", email_id).execute()
+    return response.data if response.data else []
 
 
 # ======================================================
@@ -271,7 +308,7 @@ def insert_embedding(user_id: str, embedding_id: str, embedding_type: str, vecto
         response = supabase.table("embeddings").upsert(record).execute()
         return response.data[0] if response.data else None
     except Exception as e:
-        print(f"Error inserting embedding: {e}")
+        log_error(f"Error inserting embedding: {e}")
         return None
 
 
@@ -284,7 +321,7 @@ def batch_insert_embeddings(embeddings: list):
         response = supabase.table("embeddings").upsert(embeddings).execute()
         return response.data
     except Exception as e:
-        print(f"Error batch inserting embeddings: {e}")
+        log_error(f"Error batch inserting embeddings: {e}")
         return []
 
 def delete_user_and_all_data(user_id: str):
@@ -308,9 +345,9 @@ def delete_user_and_all_data(user_id: str):
         # 6. Finally delete user itself
         supabase.table("users").delete().eq("uuid", user_id).execute()
 
-        print(f"Successfully deleted user {user_id} and all related data.")
+        log_info(f"Successfully deleted user {user_id} and all related data.")
         return True
 
     except Exception as e:
-        print(f"Error deleting user and related data: {e}")
+        log_error(f"Error deleting user and related data: {e}")
         return False

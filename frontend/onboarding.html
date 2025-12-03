@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Initializing - Retrieval Service</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <!-- User Info Display (Top Right) -->
+    <div id="userInfo" class="user-info">
+        <div class="user-avatar">
+            <img id="avatar-img" class="avatar-img" alt="Avatar"/>
+        </div>
+        <div class="user-details">
+            <span id="userName"></span>
+            <span id="userEmail"></span>
+        </div>
+        <button id="signOutBtn" class="sign-out-btn">Sign Out</button>
+    </div>
+
+    <!-- Main Content -->
+    <div class="container">
+        <div class="initialization-section">
+            <div class="init-card">
+                <h2>Initializing Your Data</h2>
+                <p class="init-message">Please wait while we fetch your emails, calendar events, and files...</p>
+                <div class="progress-container">
+                    <div class="progress-bar">
+                        <div class="progress-fill" id="progressFill"></div>
+                    </div>
+                    <div class="progress-text" id="progressText">0%</div>
+                </div>
+                <div class="init-phase" id="initPhase">Starting initialization...</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE_URL = 'http://localhost:8080';
+        let initProgressInterval = null;
+
+        // Phase messages mapping
+        const phaseMessages = {
+            'not_started': 'Preparing to initialize...',
+            'starting': 'Starting initialization...',
+            'fetching_emails': 'Fetching your emails...',
+            'emails_fetched': 'Emails fetched successfully',
+            'fetching_schedules': 'Fetching your calendar events...',
+            'schedules_fetched': 'Calendar events fetched successfully',
+            'fetching_files': 'Fetching your drive files...',
+            'files_fetched': 'Files fetched successfully',
+            'embedding_attachments': 'Processing attachments...',
+            'embedding_emails': 'Processing emails...',
+            'emails_embedded': 'Emails processed successfully',
+            'embedding_schedules': 'Processing calendar events...',
+            'schedules_embedded': 'Calendar events processed successfully',
+            'embedding_files': 'Processing files...',
+            'files_embedded': 'Files processed successfully',
+            'completed': 'Initialization complete! Redirecting...',
+            'failed': 'Initialization failed. Please try again.'
+        };
+
+        // Check authentication and initialization status
+        async function checkAuthStatus() {
+            try {
+                const response = await fetch(`${API_BASE_URL}/api/auth/status`, {
+                    credentials: 'include'
+                });
+                const data = await response.json();
+                
+                if (!data.authenticated) {
+                    window.location.href = '/login.html';
+                    return;
+                }
+
+                // Show user info
+                showUserInfo(data.user);
+
+                // Check initialization status
+                if (data.status === 'active') {
+                    stopProgressPolling();
+                    window.location.href = '/index.html';
+                } else if (data.status === 'error') {
+                    stopProgressPolling();
+                    showErrorUI('Initialization failed. Please try signing out and signing in again.');
+                } else if (data.status === 'pending' || data.status === 'processing') {
+                    updateInitializationProgress(data);
+                    if (!initProgressInterval) {
+                        startProgressPolling();
+                    }
+                }
+            } catch (error) {
+                console.error('Error checking auth status:', error);
+                window.location.href = '/login.html';
+            }
+        }
+
+        // Show user info
+        function showUserInfo(user) {
+            document.getElementById('userName').textContent = user.name || 'User';
+            document.getElementById('userEmail').textContent = user.email || '';
+            document.getElementById('avatar-img').src = user.picture || 'user.png';
+        }
+
+        // Update initialization progress
+        function updateInitializationProgress(data) {
+            const progressFill = document.getElementById('progressFill');
+            const progressText = document.getElementById('progressText');
+            const initPhase = document.getElementById('initPhase');
+            
+            const progress = data.init_progress || 0;
+            progressFill.style.width = `${progress}%`;
+            progressText.textContent = `${progress}%`;
+            initPhase.textContent = phaseMessages[data.init_phase] || 'Processing...';
+        }
+
+        // Start polling for progress updates
+        function startProgressPolling() {
+            initProgressInterval = setInterval(async () => {
+                try {
+                    const response = await fetch(`${API_BASE_URL}/api/auth/status`, {
+                        credentials: 'include'
+                    });
+                    const data = await response.json();
+                    
+                    if (data.authenticated) {
+                        if (data.status === 'active') {
+                            stopProgressPolling();
+                            window.location.href = '/index.html';
+                        } else if (data.status === 'error') {
+                            stopProgressPolling();
+                            showErrorUI('Initialization failed. Please try signing out and signing in again.');
+                        } else if (data.status === 'pending' || data.status === 'processing') {
+                            updateInitializationProgress(data);
+                        }
+                    } else {
+                        stopProgressPolling();
+                        window.location.href = '/login.html';
+                    }
+                } catch (error) {
+                    console.error('Error polling progress:', error);
+                }
+            }, 2000); // Poll every 2 seconds
+        }
+
+        // Stop polling for progress updates
+        function stopProgressPolling() {
+            if (initProgressInterval) {
+                clearInterval(initProgressInterval);
+                initProgressInterval = null;
+            }
+        }
+
+        // Show error UI
+        function showErrorUI(message) {
+            const initCard = document.querySelector('.init-card');
+            initCard.className = 'init-card error';
+            initCard.innerHTML = `
+                <h2>Error</h2>
+                <p class="error-message">${message}</p>
+                <button onclick="handleSignOut()" class="retry-btn">Sign Out</button>
+            `;
+        }
+
+        // Handle Sign Out
+        async function handleSignOut() {
+            try {
+                await fetch(`${API_BASE_URL}/api/auth/logout`, {
+                    method: 'POST',
+                    credentials: 'include'
+                });
+            } catch (error) {
+                console.error('Error during logout:', error);
+            }
+            window.location.href = '/login.html';
+        }
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', () => {
+            document.getElementById('signOutBtn').addEventListener('click', handleSignOut);
+            checkAuthStatus();
+        });
+    </script>
+</body>
+</html>

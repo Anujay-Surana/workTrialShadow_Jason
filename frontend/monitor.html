@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>API Monitor</title>
+    <link rel="stylesheet" href="style.css">
+    <style>
+        .monitor-container {
+            width: 100%;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 40px 20px;
+        }
+
+        .monitor-header {
+            margin-bottom: 2rem;
+            padding-bottom: 1rem;
+            border-bottom: 1px solid #e5e5e5;
+        }
+
+        .monitor-header h1 {
+            font-size: 1.5rem;
+            font-weight: 400;
+            color: #000000;
+            margin-bottom: 0.5rem;
+        }
+
+        .monitor-header p {
+            font-size: 0.9rem;
+            color: #666666;
+            font-weight: 300;
+        }
+
+        .risk-section {
+            background: white;
+            border: 1px solid #e5e5e5;
+            padding: 1.5rem;
+            margin-bottom: 2rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .risk-level {
+            font-size: 3rem;
+            font-weight: 300;
+            color: #000000;
+        }
+
+        .risk-level.low { color: #2e7d32; }
+        .risk-level.medium { color: #e65100; }
+        .risk-level.high { color: #c62828; }
+
+        .risk-info {
+            text-align: right;
+        }
+
+        .risk-label {
+            font-size: 0.85rem;
+            color: #999999;
+            text-transform: uppercase;
+            margin-bottom: 0.25rem;
+        }
+
+        .risk-reason {
+            font-size: 0.9rem;
+            color: #666666;
+        }
+
+        .chart-section {
+            background: white;
+            border: 1px solid #e5e5e5;
+            padding: 1.5rem;
+            margin-bottom: 2rem;
+        }
+
+        .chart-header {
+            font-size: 0.9rem;
+            font-weight: 500;
+            color: #333333;
+            margin-bottom: 1rem;
+            padding-bottom: 0.5rem;
+            border-bottom: 1px solid #e5e5e5;
+        }
+
+        #timelineChart {
+            width: 100%;
+            height: 200px;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }
+
+        .stat-card {
+            background: white;
+            border: 1px solid #e5e5e5;
+            padding: 1.5rem;
+        }
+
+        .stat-card-title {
+            font-size: 0.85rem;
+            color: #999999;
+            text-transform: uppercase;
+            margin-bottom: 0.5rem;
+        }
+
+        .stat-card-value {
+            font-size: 2rem;
+            font-weight: 300;
+            color: #000000;
+        }
+
+        .stat-card-subtitle {
+            font-size: 0.8rem;
+            color: #666666;
+            margin-top: 0.5rem;
+        }
+
+        .api-breakdown {
+            background: white;
+            border: 1px solid #e5e5e5;
+            padding: 1.5rem;
+        }
+
+        .api-breakdown-title {
+            font-size: 0.9rem;
+            font-weight: 500;
+            color: #333333;
+            margin-bottom: 1rem;
+            padding-bottom: 0.5rem;
+            border-bottom: 1px solid #e5e5e5;
+        }
+
+        .api-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 0.75rem 0;
+            border-bottom: 1px solid #f5f5f5;
+        }
+
+        .api-item:last-child {
+            border-bottom: none;
+        }
+
+        .api-name {
+            font-size: 0.9rem;
+            color: #333333;
+            font-weight: 400;
+        }
+
+        .api-stats {
+            display: flex;
+            gap: 1.5rem;
+            font-size: 0.85rem;
+        }
+
+        .api-stat {
+            color: #666666;
+        }
+
+        .api-stat.error {
+            color: #c62828;
+        }
+
+        .api-stat.retry {
+            color: #e65100;
+        }
+
+        .refresh-info {
+            text-align: center;
+            font-size: 0.8rem;
+            color: #999999;
+            margin-top: 2rem;
+            padding-top: 1rem;
+            border-top: 1px solid #e5e5e5;
+        }
+    </style>
+</head>
+<body>
+    <div class="monitor-container">
+        <div class="monitor-header" style="display: flex; justify-content: space-between; align-items: center;">
+            <div>
+                <h1>API Rate Limit Monitor</h1>
+                <p>Real-time monitoring of API usage, errors, and rate limit risk</p>
+            </div>
+            <a href="/index.html" style="padding: 0.5rem 1rem; background: white; color: #000000; border: 1px solid #cccccc; text-decoration: none; font-size: 0.9rem; border-radius: 4px; transition: all 0.2s ease;">Back to App</a>
+        </div>
+
+        <!-- Risk Level -->
+        <div class="risk-section">
+            <div>
+                <div class="risk-label">Risk Level</div>
+                <div class="risk-level" id="riskLevel">--</div>
+            </div>
+            <div class="risk-info">
+                <div class="risk-label">Status</div>
+                <div class="risk-reason" id="riskReason">Loading...</div>
+            </div>
+        </div>
+
+        <!-- Timeline Chart -->
+        <div class="chart-section">
+            <div class="chart-header">Request Timeline (Last Hour)</div>
+            <canvas id="timelineChart" width="1000" height="200"></canvas>
+        </div>
+
+        <!-- Quick Stats -->
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-card-title">Last 10 Minutes</div>
+                <div class="stat-card-value" id="stat10min">0</div>
+                <div class="stat-card-subtitle">requests</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-card-title">Last Hour</div>
+                <div class="stat-card-value" id="stat1hour">0</div>
+                <div class="stat-card-subtitle">requests</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-card-title">Last Day</div>
+                <div class="stat-card-value" id="stat1day">0</div>
+                <div class="stat-card-subtitle">requests</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-card-title">Errors (1h)</div>
+                <div class="stat-card-value" id="statErrors" style="color: #c62828;">0</div>
+                <div class="stat-card-subtitle">failed requests</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-card-title">Retries (1h)</div>
+                <div class="stat-card-value" id="statRetries" style="color: #e65100;">0</div>
+                <div class="stat-card-subtitle">retry attempts</div>
+            </div>
+        </div>
+
+        <!-- API Breakdown -->
+        <div class="api-breakdown">
+            <div class="api-breakdown-title">API Breakdown (Last Hour)</div>
+            <div id="apiBreakdown">
+                <div class="api-item">
+                    <span class="api-name">Loading...</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="refresh-info">
+            Auto-refreshes every 10 seconds
+        </div>
+    </div>
+
+    <script>
+        const API_BASE_URL = 'http://localhost:8080';
+
+        // Check authentication status
+        async function checkAuthStatus() {
+            try {
+                const response = await fetch(`${API_BASE_URL}/api/auth/status`, {
+                    credentials: 'include'
+                });
+                const data = await response.json();
+                
+                if (!data.authenticated) {
+                    window.location.href = '/login.html';
+                    return false;
+                }
+
+                if (data.status === 'pending' || data.status === 'processing') {
+                    window.location.href = '/onboarding.html';
+                    return false;
+                }
+
+                return data.status === 'active';
+            } catch (error) {
+                console.error('Error checking auth status:', error);
+                window.location.href = '/login.html';
+                return false;
+            }
+        }
+
+        async function loadMonitoringData() {
+            try {
+                const response = await fetch(`${API_BASE_URL}/health/status`);
+                const data = await response.json();
+                
+                if (data.monitoring) {
+                    updateMonitoringDisplay(data.monitoring);
+                }
+            } catch (error) {
+                console.error('Error loading monitoring data:', error);
+            }
+        }
+
+        function updateMonitoringDisplay(monitoring) {
+            // Update risk level
+            const riskLevel = monitoring.risk_level;
+            const riskElement = document.getElementById('riskLevel');
+            riskElement.textContent = riskLevel;
+            riskElement.className = 'risk-level';
+            
+            if (riskLevel < 30) {
+                riskElement.classList.add('low');
+            } else if (riskLevel < 70) {
+                riskElement.classList.add('medium');
+            } else {
+                riskElement.classList.add('high');
+            }
+            
+            document.getElementById('riskReason').textContent = monitoring.risk_reason;
+            
+            // Update stats
+            document.getElementById('stat10min').textContent = monitoring.stats['10min'].total_requests;
+            document.getElementById('stat1hour').textContent = monitoring.stats['1hour'].total_requests;
+            document.getElementById('stat1day').textContent = monitoring.stats['1day'].total_requests;
+            document.getElementById('statErrors').textContent = monitoring.stats['1hour'].total_errors;
+            document.getElementById('statRetries').textContent = monitoring.stats['1hour'].total_retries;
+            
+            // Update API breakdown
+            updateAPIBreakdown(monitoring.stats['1hour'].api_breakdown);
+            
+            // Draw chart
+            drawTimelineChart(monitoring.timeline['1hour']);
+        }
+
+        function updateAPIBreakdown(apiBreakdown) {
+            const container = document.getElementById('apiBreakdown');
+            
+            if (Object.keys(apiBreakdown).length === 0) {
+                container.innerHTML = '<div class="api-item"><span class="api-name">No data yet</span></div>';
+                return;
+            }
+            
+            let html = '';
+            for (const [api, stats] of Object.entries(apiBreakdown)) {
+                html += `
+                    <div class="api-item">
+                        <span class="api-name">${api}</span>
+                        <div class="api-stats">
+                            <span class="api-stat">Total: ${stats.total}</span>
+                            <span class="api-stat error">Errors: ${stats.errors}</span>
+                            <span class="api-stat retry">Retries: ${stats.retries}</span>
+                        </div>
+                    </div>
+                `;
+            }
+            
+            container.innerHTML = html;
+        }
+
+        function drawTimelineChart(timeline) {
+            const canvas = document.getElementById('timelineChart');
+            const ctx = canvas.getContext('2d');
+            const width = canvas.width;
+            const height = canvas.height;
+            
+            // Clear canvas
+            ctx.clearRect(0, 0, width, height);
+            
+            if (!timeline || timeline.length === 0) return;
+            
+            // Find max value for scaling
+            const maxValue = Math.max(...timeline.map(t => t.requests), 1);
+            
+            const padding = 40;
+            const chartWidth = width - padding * 2;
+            const chartHeight = height - padding * 2;
+            const barWidth = chartWidth / timeline.length;
+            
+            // Draw axes
+            ctx.strokeStyle = '#e5e5e5';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(padding, padding);
+            ctx.lineTo(padding, height - padding);
+            ctx.lineTo(width - padding, height - padding);
+            ctx.stroke();
+            
+            // Draw bars
+            timeline.forEach((point, i) => {
+                const x = padding + i * barWidth;
+                const requestHeight = (point.requests / maxValue) * chartHeight;
+                const errorHeight = (point.errors / maxValue) * chartHeight;
+                const retryHeight = (point.retries / maxValue) * chartHeight;
+                
+                // Draw request bar (black)
+                if (point.requests > 0) {
+                    ctx.fillStyle = '#000000';
+                    ctx.fillRect(x + 2, height - padding - requestHeight, barWidth - 4, requestHeight);
+                }
+                
+                // Draw error bar on top (red)
+                if (point.errors > 0) {
+                    ctx.fillStyle = '#c62828';
+                    ctx.fillRect(x + 2, height - padding - errorHeight, barWidth - 4, errorHeight);
+                }
+                
+                // Draw retry indicator (orange dot)
+                if (point.retries > 0) {
+                    ctx.fillStyle = '#e65100';
+                    ctx.beginPath();
+                    ctx.arc(x + barWidth / 2, height - padding - retryHeight - 5, 3, 0, Math.PI * 2);
+                    ctx.fill();
+                }
+            });
+            
+            // Draw labels
+            ctx.fillStyle = '#666666';
+            ctx.font = '10px sans-serif';
+            ctx.textAlign = 'center';
+            
+            // X-axis labels (show every 5th point)
+            timeline.forEach((point, i) => {
+                if (i % 5 === 0) {
+                    const x = padding + i * barWidth + barWidth / 2;
+                    const time = new Date(point.timestamp);
+                    const label = time.getHours() + ':' + String(time.getMinutes()).padStart(2, '0');
+                    ctx.fillText(label, x, height - padding + 15);
+                }
+            });
+            
+            // Y-axis label
+            ctx.textAlign = 'right';
+            ctx.fillText(maxValue.toString(), padding - 5, padding + 5);
+            ctx.fillText('0', padding - 5, height - padding + 5);
+            
+            // Legend
+            ctx.textAlign = 'left';
+            ctx.fillStyle = '#000000';
+            ctx.fillRect(width - padding - 100, padding, 10, 10);
+            ctx.fillStyle = '#666666';
+            ctx.fillText('Requests', width - padding - 85, padding + 9);
+            
+            ctx.fillStyle = '#c62828';
+            ctx.fillRect(width - padding - 100, padding + 15, 10, 10);
+            ctx.fillStyle = '#666666';
+            ctx.fillText('Errors', width - padding - 85, padding + 24);
+        }
+
+        // Initialize
+        async function init() {
+            const isAuthenticated = await checkAuthStatus();
+            if (isAuthenticated) {
+                loadMonitoringData();
+                // Auto-refresh every 10 seconds
+                setInterval(loadMonitoringData, 10000);
+            }
+        }
+
+        // Start
+        init();
+    </script>
+</body>
+</html>

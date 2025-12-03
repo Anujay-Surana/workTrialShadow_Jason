@@ -1,47 +1,18 @@
 """
-Real ReAct Agent Implementation
-Uses Thought -> Action -> Observation loop pattern
+ReAct (Reasoning and Acting) agent implementation.
+
+This module implements the ReAct agent pattern with Thought-Action-Observation loops
+for intelligent memory retrieval from user's personal data.
 """
 
 import re
 import json
-from typing import List, Dict, Tuple, AsyncGenerator
-from .search_utils import vector_search, keyword_search, fuzzy_search
-from .supabase_utils import supabase
+from typing import List, Dict, Tuple
+from retrieval_service.search import vector_search, keyword_search, fuzzy_search
+from retrieval_service.data.database import supabase
+from retrieval_service.search import parse_reference_ids, fetch_references_by_ids
+from retrieval_service.infrastructure.logging import log_debug, log_info, log_warning, log_error
 from dotenv import load_dotenv
-
-
-def fetch_full_reference(ref_type: str, ref_id: str) -> Dict:
-    """
-    Fetch complete row data from database for a reference.
-    Returns the entire database row as a dictionary.
-    """
-    try:
-        if ref_type == 'email':
-            resp = supabase.table('emails').select('*').eq('id', ref_id).execute()
-            if resp.data and len(resp.data) > 0:
-                return {"type": "email", **resp.data[0]}
-        
-        elif ref_type == 'schedule':
-            resp = supabase.table('schedules').select('*').eq('id', ref_id).execute()
-            if resp.data and len(resp.data) > 0:
-                return {"type": "schedule", **resp.data[0]}
-        
-        elif ref_type == 'file':
-            resp = supabase.table('files').select('*').eq('id', ref_id).execute()
-            if resp.data and len(resp.data) > 0:
-                return {"type": "file", **resp.data[0]}
-        
-        elif ref_type == 'attachment':
-            resp = supabase.table('attachments').select('*').eq('id', ref_id).execute()
-            if resp.data and len(resp.data) > 0:
-                return {"type": "attachment", **resp.data[0]}
-        
-        return None
-    
-    except Exception as e:
-        print(f"Error fetching {ref_type} {ref_id}: {e}")
-        return None
 
 REACT_SYSTEM_PROMPT = """You are a memory retrieval agent that extracts factual context from user data.
 
@@ -144,9 +115,8 @@ async def execute_search_tool_with_results(tool: str, arg: str, user_id: str) ->
         
         if tool == "vector_search":
             # Use embedding-based search
-            from .gemni_api_utils import embed_text
+            from retrieval_service.api.gemini_client import embed_text
             query_embedding = embed_text(query)
-            from .search_utils import vector_search
             results = vector_search(user_id, query_embedding, top_k=3)
         elif tool == "keyword_search":
             # Keyword search with single query
@@ -174,7 +144,7 @@ async def execute_search_tool_with_results(tool: str, arg: str, user_id: str) ->
                 if result_type == 'email':
                     response = supabase.table('emails').select('subject, body, from_user, date')\
                         .eq('user_id', user_id).eq('id', result_id).execute()
-                    if response.data:
+                    if response.data and len(response.data) > 0:
                         email = response.data[0]
                         content = f"ID: {source_id}\nSubject: {email.get('subject', 'N/A')}\nFrom: {email.get('from_user', 'N/A')}\nDate: {email.get('date', 'N/A')}\n{email.get('body', '')[:200]}"
                         formatted.append(f"Result {i} [Email] (score: {score:.3f}):\n{content}")
@@ -182,7 +152,7 @@ async def execute_search_tool_with_results(tool: str, arg: str, user_id: str) ->
                 elif result_type == 'schedule':
                     response = supabase.table('schedules').select('summary, description, start_time, location')\
                         .eq('user_id', user_id).eq('id', result_id).execute()
-                    if response.data:
+                    if response.data and len(response.data) > 0:
                         schedule = response.data[0]
                         content = f"ID: {source_id}\nTitle: {schedule.get('summary', 'N/A')}\nTime: {schedule.get('start_time', 'N/A')}\nLocation: {schedule.get('location', 'N/A')}\n{schedule.get('description', '')[:200]}"
                         formatted.append(f"Result {i} [Schedule] (score: {score:.3f}):\n{content}")
@@ -190,7 +160,7 @@ async def execute_search_tool_with_results(tool: str, arg: str, user_id: str) ->
                 elif result_type == 'file':
                     response = supabase.table('files').select('name, summary, mime_type')\
                         .eq('user_id', user_id).eq('id', result_id).execute()
-                    if response.data:
+                    if response.data and len(response.data) > 0:
                         file = response.data[0]
                         content = f"ID: {source_id}\nName: {file.get('name', 'N/A')}\nType: {file.get('mime_type', 'N/A')}\n{file.get('summary', 'No summary')[:200]}"
                         formatted.append(f"Result {i} [File] (score: {score:.3f}):\n{content}")
@@ -198,13 +168,13 @@ async def execute_search_tool_with_results(tool: str, arg: str, user_id: str) ->
                 elif result_type == 'attachment':
                     response = supabase.table('attachments').select('filename, summary, mime_type')\
                         .eq('user_id', user_id).eq('id', result_id).execute()
-                    if response.data:
+                    if response.data and len(response.data) > 0:
                         attachment = response.data[0]
                         content = f"ID: {source_id}\nFilename: {attachment.get('filename', 'N/A')}\nType: {attachment.get('mime_type', 'N/A')}\n{attachment.get('summary', 'No summary')[:200]}"
                         formatted.append(f"Result {i} [Attachment] (score: {score:.3f}):\n{content}")
             
             except Exception as e:
-                print(f"Error fetching {result_type} {result_id}: {e}")
+                log_error(f"Error fetching {result_type} {result_id}: {e}")
                 continue
         
         observation = "\n\n".join(formatted) if formatted else "No results found."
@@ -221,7 +191,7 @@ async def react_agent_direct(messages: List[Dict], user_id: str, max_iterations:
     Real ReAct agent with Thought-Action-Observation loop.
     Returns complete result as JSON with third-person perspective.
     """
-    from .openai_api_utils import async_client
+    from retrieval_service.api.openai_client import async_client
     import os
     
     verbose = os.getenv("VERBOSE_OUTPUT", "false").lower() == "true"
@@ -247,16 +217,16 @@ async def react_agent_direct(messages: List[Dict], user_id: str, max_iterations:
         output = response.choices[0].message.content
         
         if verbose:
-            print(f"[ReAct] Iteration {iteration}:")
-            print(output)
-            print("---")
+            log_info(f"[ReAct] Iteration {iteration}:")
+            log_info(output)
+            log_info("---")
         
         # Check if model hallucinated an Observation
         if "Observation:" in output.lower():
             # Remove the hallucinated observation
             output = output.split("Observation:")[0].strip()
             if verbose:
-                print("[ReAct] WARNING: Model tried to write Observation, removed it")
+                log_warning("[ReAct] WARNING: Model tried to write Observation, removed it")
         
         tool, arg = parse_action(output)
         
@@ -268,45 +238,14 @@ async def react_agent_direct(messages: List[Dict], user_id: str, max_iterations:
         if tool == "finish":
             # Extract content and parse REFERENCE_IDS
             full_output = arg.strip()
-            content = full_output
-            selected_ids = []
-            
-            # Extract REFERENCE_IDS line
-            ref_match = re.search(r'REFERENCE_IDS:\s*(.+?)(?:\n|$)', full_output, re.IGNORECASE)
-            if ref_match:
-                ref_line = ref_match.group(1).strip()
-                # Remove the REFERENCE_IDS line from content
-                content = re.sub(r'REFERENCE_IDS:.*?(?:\n|$)', '', full_output, flags=re.IGNORECASE).strip()
-                
-                if ref_line.lower() != 'none':
-                    # Parse comma-separated IDs
-                    selected_ids = [id.strip() for id in ref_line.split(',') if id.strip()]
+            content, selected_ids = parse_reference_ids(full_output)
             
             # Fetch full reference data for selected IDs
-            selected_references = []
-            for ref_id in selected_ids:
-                try:
-                    # Parse type and ID from format like "email_123"
-                    if '_' in ref_id:
-                        ref_type, ref_db_id = ref_id.split('_', 1)
-                    else:
-                        # Try to find in all_search_results
-                        matching = [r for r in all_search_results if str(r.get('id')) == ref_id]
-                        if matching:
-                            ref_type = matching[0].get('type')
-                            ref_db_id = ref_id
-                        else:
-                            continue
-                    
-                    # Fetch complete row from database
-                    full_ref = fetch_full_reference(ref_type, ref_db_id)
-                    if full_ref:
-                        selected_references.append(full_ref)
-                
-                except Exception as e:
-                    if verbose:
-                        print(f"[ReAct] Error fetching reference {ref_id}: {e}")
-                    continue
+            selected_references = fetch_references_by_ids(
+                selected_ids,
+                all_search_results,
+                verbose=verbose
+            )
             
             result = {
                 "content": content,

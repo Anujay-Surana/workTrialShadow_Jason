@@ -1,7 +1,14 @@
-import json
+"""
+Agent definitions for the retrieval service.
 
-from retrieval_service import openai_api_utils
-from retrieval_service.search_utils import DEFAULT_TOP_K
+This module contains tool definitions and system prompts for the ReAct agent.
+Includes search tool specifications and the ReAct system prompt.
+"""
+
+import json
+import os
+
+DEFAULT_TOP_K = int(os.getenv("SEARCH_TOP_K", "5"))
 
 SEARCH_TOOLS = [
     {
