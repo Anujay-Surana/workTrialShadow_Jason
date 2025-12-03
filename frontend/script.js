@@ -15,8 +15,8 @@ async function checkAuthStatus() {
                 showInitializationUI(data);
                 startProgressPolling();
             } else if (data.status === 'active') {
-                // Initialization complete, redirect to chat
-                window.location.href = '/chat.html';
+                // Initialization complete, redirect to test
+                window.location.href = '/test.html';
             } else if (data.status === 'error') {
                 showErrorUI('Initialization failed. Please try signing out and signing in again.');
             } else {

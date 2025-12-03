@@ -110,41 +110,66 @@ def combined_search(
     return context, references, final_results
 
 
-def build_rag_prompt(user_message: str, context: str, user_info: dict) -> str:
+def build_rag_prompt(query: str, context: str, user_info: dict, raw_results: List[Dict] = None) -> str:
     """
-    Build a prompt for RAG mode that includes the retrieved context.
+    Build a prompt for memory retrieval with raw result IDs.
     
     Args:
-        user_message: User's question/message
+        query: User's search query
         context: Retrieved context from search
         user_info: User information from Google OAuth
+        raw_results: Raw search results with IDs
     
     Returns:
-        Formatted prompt with context
+        Formatted prompt for context extraction
     """
     if not context or context.strip() == "":
-        return f"""You are a helpful assistant with access to the user's personal data.
+        return f"""Query: {query}
 
-The user asked: {user_message}
+No data retrieved from user's personal records.
 
-Unfortunately, I couldn't find any relevant information in your personal data to answer this question. This could mean:
-1. The information doesn't exist in your emails, calendar, or files
-2. The question doesn't require personal data (general knowledge question)
-
-Please answer the user's question to the best of your ability. If it's a general knowledge question, answer it directly. If it requires personal data that wasn't found, let them know politely.
-
-User info (for reference): {user_info.get('email', 'unknown')}"""
+Output (third-person perspective):
+No relevant information exists in user's personal data.
+REFERENCE_IDS: none"""
     
-    return f"""You are a helpful assistant analyzing the user's personal data.
+    # Build a list of available sources with IDs
+    sources_list = []
+    if raw_results:
+        for i, result in enumerate(raw_results[:10], 1):  # Limit to top 10
+            result_type = result.get('type', 'unknown')
+            result_id = result.get('id', 'unknown')
+            score = result.get('score', 0)
+            sources_list.append(f"[{result_type}_{result_id}] (score: {score:.2f})")
+    
+    sources_text = "\n".join(sources_list) if sources_list else "No sources available"
+    
+    return f"""Query: {query}
 
-The user asked: {user_message}
+Available sources (with IDs):
+{sources_text}
 
-Here is the relevant information I found from your emails, calendar events, and files:
-
+Retrieved information from user's data:
 {context}
 
-Please answer the user's question based on this information. Be specific and cite which sources you're using (e.g., "According to the email from...", "Based on your calendar event...", etc.).
+Extract a SHORT factual summary (max 3-4 sentences or bullet points) in THIRD-PERSON perspective. Use "they/them" as the pronoun to avoid pronoun issues.
+You only provides context for other LLMs to answer, your response is for LLMs
 
-If the context doesn't fully answer the question, acknowledge what you know and what you don't know.
+Use phrases like:
+- "User has [X] emails about..."
+- "Data contains meeting scheduled for..."
+- "Records show deadline of..."
+- "Calendar includes event on..."
 
-User info (for reference): {user_info.get('email', 'unknown')}"""
+Do NOT use:
+- "I found..."
+- "I see..."
+- "Here's what..."
+- "Let me..."
+
+Then list REFERENCE_IDS of sources used in your summary.
+
+Format:
+[Objective summary in third-person]
+REFERENCE_IDS: [comma-separated IDs like: email_123, schedule_456, file_789]
+
+Only include IDs directly relevant to your summary."""

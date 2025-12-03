@@ -21,17 +21,19 @@ import io
 import base64
 
 from retrieval_service import openai_api_utils
-from retrieval_service.agent import REACT_SYSTEM_PROMPT
 from retrieval_service.google_api_utils import initialize_user_data
-from retrieval_service.supabase_utils import get_user_by_email, create_user
-from fastapi.responses import StreamingResponse
-import json
+from retrieval_service.supabase_utils import get_user_by_email, create_user, delete_user_and_all_data
 from retrieval_service.ocr_utils import init_model
 
 load_dotenv()
-print("Loading OCR model...")
+
+VERBOSE_OUTPUT = os.getenv("VERBOSE_OUTPUT", "false").lower() == "true"
+
+if VERBOSE_OUTPUT:
+    print("Loading OCR model...")
 init_model(['en'])
-print("OCR model loaded.")
+if VERBOSE_OUTPUT:
+    print("OCR model loaded.")
 
 app = FastAPI()
 
@@ -255,6 +257,16 @@ async def google_callback(request: Request, code: str = None, state: str = None)
                     
                     # Start initialization in background thread
                     run_initialization_in_background(new_user["uuid"], credentials, debug_mode=debug_mode)
+            if existing_user.get("init_phase") == "failed":
+                delete_user_and_all_data(existing_user.get("uuid"))
+                if new_user:
+                    # Check DEBUG_MODE environment variable
+                    debug_mode = os.getenv("DEBUG_MODE", "false").lower() == "true"
+                    if debug_mode:
+                        print("[DEBUG MODE ENABLED] Previous init failed, restarting, Will process only latest 50 files")
+                    
+                    # Start initialization in background thread
+                    run_initialization_in_background(new_user["uuid"], credentials, debug_mode=debug_mode)
         except Exception as e:
             print(f"Error checking/creating user: {e}")
 
@@ -422,15 +434,19 @@ async def logout(request: Request):
     response.delete_cookie("oauth_state")
     return response
 
-@app.post("/api/chat")
-async def chat(request: Request):
+@app.post("/api/memory/retrieval")
+async def memory_retrieval(request: Request):
     """
-    Stream chat responses with either RAG mode (default) or ReAct agent mode.
+    Memory retrieval endpoint - one-time query against user's personal data.
     
     Request body:
-        - message: User's message
-        - history: Chat history
-        - mode: "rag" (default) or "agent"
+        - query: Search query (required)
+        - mode: "rag" | "mixed" | "react" (optional, default: "rag")
+    
+    Response:
+        - content: Generated response text
+        - references: List of source references
+        - process: Processing steps (only if VERBOSE_OUTPUT=true)
     """
     credentials = get_credentials_from_cookies(request)
     if not credentials:
@@ -452,90 +468,74 @@ async def chat(request: Request):
         user_id = db_user["uuid"]
 
         body = await request.json()
-        user_message = body.get("message", "")
-        history = body.get("history", [])
-        mode = body.get("mode", "rag")  # Default to RAG mode: "rag", "mixed", or "react"
+        query = body.get("query", "")
+        mode = body.get("mode", "rag")
 
-        if not user_message:
-            return JSONResponse({"error": "No message provided"}, status_code=400)
+        if not query:
+            return JSONResponse({"error": "No query provided"}, status_code=400)
 
         now = datetime.now()
         weekday_name = calendar.day_name[now.weekday()]
         current_datetime = now.strftime("%Y-%m-%d %H:%M:%S")
 
-        # Build system message based on mode
-        if mode == "mixed":
-            # Mixed mode: RAG + optional tool calling
-            system_content = REACT_SYSTEM_PROMPT + (
-                f"\n\nCurrent date and time: {current_datetime} ({weekday_name}).\n"
-                f"User info JSON (for your reference, do NOT leak sensitive fields verbatim):\n{user_info}\n\n"
-                f"When you want to provide download links, use the format: [Title](URL)\n"
-                f"The download link can be obtained from the ids of attachments or drive files:\n"
-                f"- For Google Drive files, use http://localhost:8080/api/download/drive-direct/{{file_db_id}}\n"
-                f"- For Gmail attachments, use http://localhost:8080/api/download/attachment-direct/{{attachment_db_id}}\n"
-            )
-        else:
-            # RAG and React modes use simpler system prompt (React has its own in react_agent_utils)
-            system_content = (
-                f"You are a helpful assistant with access to the user's personal data.\n"
-                f"Current date and time: {current_datetime} ({weekday_name}).\n\n"
-                f"When you want to provide download links, use the format: [Title](URL)\n"
-                f"The download link can be obtained from the ids of attachments or drive files:\n"
-                f"- For Google Drive files, use http://localhost:8080/api/download/drive-direct/{{file_db_id}}\n"
-                f"- For Gmail attachments, use http://localhost:8080/api/download/attachment-direct/{{attachment_db_id}}\n"
-            )
-
-        system_message = {
-            "role": "system",
-            "content": system_content,
-        }
-
-        messages = [system_message]
-
-        for msg in history:
-            messages.append({"role": msg["role"], "content": msg["content"]})
-
-        messages.append({"role": "user", "content": user_message})
-
-        async def generate():
-            try:
-                if mode == "react":
-                    # Real ReAct agent with Thought-Action-Observation loop
-                    from retrieval_service import react_agent_utils
-                    async for event in react_agent_utils.react_agent_stream(messages, user_id):
-                        yield "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
-                        await asyncio.sleep(0)
-                elif mode == "mixed":
-                    # Mixed mode: RAG + optional tool calling
-                    async for event in openai_api_utils.react_with_tools_stream(messages, user_id):
-                        yield "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
-                        await asyncio.sleep(0)
-                else:
-                    # Direct RAG mode (default)
-                    async for event in openai_api_utils.rag_direct_stream(messages, user_id, user_message, user_info):
-                        yield "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
-                        await asyncio.sleep(0)
-            except Exception as e:
-                import traceback
-                print(f"[CHAT ERROR] {e}")
-                print(traceback.format_exc())
-                err = {"type": "error", "error": str(e)}
-                yield "data: " + json.dumps(err, ensure_ascii=False) + "\n\n"
-
-        return StreamingResponse(
-            generate(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            },
+        system_content = (
+            f"You are a memory retrieval module that extracts factual context from user data.\n"
+            f"Current date and time: {current_datetime} ({weekday_name}).\n"
+            f"User: {user_info.get('name')} ({user_info.get('email')})\n\n"
+            f"CRITICAL INSTRUCTIONS:\n"
+            f"1. Write in THIRD-PERSON perspective (describe what exists in the data)\n"
+            f"2. Do NOT use first-person ('I found', 'I see') - use third-person ('User has', 'Data contains', 'Records show')\n"
+            f"3. Keep responses SHORT - maximum 3-4 sentences or bullet points\n"
+            f"4. Extract ONLY factual information, no opinions or advice\n"
+            f"5. Focus on: dates, people, actions, deadlines, key facts\n"
+            f"6. If no relevant data exists, state it objectively\n\n"
+            f"OUTPUT FORMAT:\n"
+            f"First line: Objective summary of what data exists\n"
+            f"Following lines: Key facts in bullet points (if multiple)\n"
+            f"Last line: REFERENCE_IDS: [comma-separated list of source IDs]\n\n"
+            f"CORRECT EXAMPLES:\n"
+            f"✓ 'User has 2 emails about project deadline from Sarah.'\n"
+            f"✓ 'Data contains meeting scheduled for Dec 5, 2PM.'\n"
+            f"✓ 'Records show budget proposal due Dec 3.'\n"
+            f"✓ 'No relevant information exists in user data.'\n\n"
+            f"INCORRECT EXAMPLES:\n"
+            f"✗ 'I found 2 emails about project deadline.'\n"
+            f"✗ 'I see you have a meeting on Dec 5.'\n"
+            f"✗ 'Let me help you with that.'\n"
+            f"✗ 'Here's what I discovered...'\n\n"
+            f"Example output:\n"
+            f"User has 2 emails about project deadline from Sarah.\n"
+            f"- Meeting scheduled Dec 5, 2PM with Sarah\n"
+            f"- Budget proposal due Dec 3\n"
+            f"REFERENCE_IDS: email_123, email_456, event_789\n\n"
+            f"If no data found:\n"
+            f"No relevant information exists in user's personal data.\n"
+            f"REFERENCE_IDS: none\n"
         )
+
+        system_message = {"role": "system", "content": system_content}
+        
+        user_prompt = f"Query: {query}\n\nExtract factual context in third-person perspective with relevant REFERENCE_IDS."
+        
+        messages = [system_message, {"role": "user", "content": user_prompt}]
+
+        if mode == "react":
+            from retrieval_service import react_agent_utils
+            result = await react_agent_utils.react_agent_direct(messages, user_id)
+        elif mode == "mixed":
+            result = await openai_api_utils.react_with_tools_direct(messages, user_id)
+        else:
+            result = await openai_api_utils.rag_direct(messages, user_id, query, user_info)
+
+        return JSONResponse(result)
 
     except Exception as e:
         import traceback
+        if VERBOSE_OUTPUT:
+            print(f"[RETRIEVAL ERROR] {e}")
+            print(traceback.format_exc())
         return JSONResponse(
-            {"error": str(e), "traceback": traceback.format_exc()},
+            {"error": str(e)},
             status_code=500,
         )
 

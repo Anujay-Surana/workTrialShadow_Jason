@@ -7,16 +7,21 @@ from retrieval_service.agent import SEARCH_TOOLS
 from retrieval_service.search_utils import execute_search_tool
 import json
 
-# Load API key from .env file
 load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise ValueError("OPENAI_API_KEY not found in environment variables or .env file")
 
-# Initialize OpenAI clients (sync for non-streaming, async for streaming)
+VERBOSE_OUTPUT = os.getenv("VERBOSE_OUTPUT", "false").lower() == "true"
+
 client = OpenAI(api_key=OPENAI_API_KEY)
 async_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+def log(message: str):
+    """Log message only if VERBOSE_OUTPUT is enabled"""
+    if VERBOSE_OUTPUT:
+        print(message)
 
 
 def summarize(text: str, max_chars: int = 8000) -> str:
@@ -46,27 +51,24 @@ def summarize(text: str, max_chars: int = 8000) -> str:
     return response.choices[0].message.content.strip()
 
 
-async def chat_stream(messages: list, model: str = "gpt-4o"):
+async def chat_completion(messages: list, model: str = "gpt-4o"):
     """
-    Stream chat completions using GPT-4o (async).
+    Get chat completion using GPT-4o (async).
     
     Args:
         messages: List of message dicts with 'role' and 'content'
         model: Model to use (default: gpt-4o)
     
-    Yields:
-        str: Token chunks as they arrive
+    Returns:
+        str: Complete response text
     """
-    stream = await async_client.chat.completions.create(
+    response = await async_client.chat.completions.create(
         model=model,
         messages=messages,
-        stream=True,
         temperature=0.7,
     )
     
-    async for chunk in stream:
-        if chunk.choices[0].delta.content is not None:
-            yield chunk.choices[0].delta.content
+    return response.choices[0].message.content
 
 def chunk_text(text: str, chunk_size: int = 6000, overlap: int = 200) -> list[str]:
     """
@@ -185,7 +187,7 @@ def summarize_doc(text: str, filename: str, max_chars: int = 30000, chunk_size: 
     
     # Safety limit: prevent processing extremely long text
     if len(text) > max_chars:
-        print(f"[WARNING] File {filename} exceeds {max_chars} chars, truncating to limit")
+        log(f"[WARNING] File {filename} exceeds {max_chars} chars, truncating to limit")
         text = text[:max_chars]
     
     # If text is small enough, summarize directly
@@ -204,11 +206,11 @@ def summarize_doc(text: str, filename: str, max_chars: int = 30000, chunk_size: 
         return response.choices[0].message.content.strip()
     
     # Map-reduce approach for large texts
-    print(f"[INFO] File {filename} is large ({len(text)} chars), using chunked summarization")
+    log(f"[INFO] File {filename} is large ({len(text)} chars), using chunked summarization")
     
     # Step 1: Split into chunks
     chunks = chunk_text(text, chunk_size=chunk_size)
-    print(f"[INFO] Split into {len(chunks)} chunks")
+    log(f"[INFO] Split into {len(chunks)} chunks")
     
     # Step 2: Summarize each chunk (map)
     chunk_summaries = []
@@ -216,131 +218,132 @@ def summarize_doc(text: str, filename: str, max_chars: int = 30000, chunk_size: 
         try:
             summary = summarize_chunk(chunk, i, len(chunks))
             chunk_summaries.append(summary)
-            print(f"[INFO] Summarized chunk {i+1}/{len(chunks)}")
+            log(f"[INFO] Summarized chunk {i+1}/{len(chunks)}")
         except Exception as e:
-            print(f"[ERROR] Failed to summarize chunk {i+1}: {e}")
+            log(f"[ERROR] Failed to summarize chunk {i+1}: {e}")
             chunk_summaries.append(f"[Error summarizing section {i+1}]")
     
     # Step 3: Combine summaries (reduce)
     final_summary = combine_summaries(chunk_summaries, filename)
-    print(f"[INFO] Created final summary for {filename}")
+    log(f"[INFO] Created final summary for {filename}")
     
     return final_summary
 
-async def rag_direct_stream(messages, user_id: str, user_message: str, user_info: dict):
+async def rag_direct(messages, user_id: str, query: str, user_info: dict):
     """
-    Direct RAG mode: Perform retrieval first, then stream response.
-    This is simpler and more reliable than ReAct agent mode.
+    Direct RAG mode: Perform retrieval and generate context summary.
+    LLM decides which references to return.
+    Returns complete result as JSON.
     """
     from retrieval_service.rag_utils import combined_search, build_rag_prompt
+    from retrieval_service.supabase_utils import supabase
+    import os
+    import re
     
-    # Step 1: Contextualize the query if there's conversation history
-    search_query = user_message
+    verbose = os.getenv("VERBOSE_OUTPUT", "false").lower() == "true"
+    process_steps = []
     
-    # Check if there are previous messages (excluding system message)
-    previous_messages = [m for m in messages if m.get("role") in ["user", "assistant"]]
-    
-    if len(previous_messages) > 1:  # Has history beyond current message
-        # Create a contextual query that incorporates conversation history
-        try:
-            contextualization_prompt = f"""Given the conversation history and the latest user question, 
-rewrite the question to be a standalone search query that includes necessary context from the conversation.
-Do not answer the question, just rewrite it as a clear search query.
-
-Conversation history:
-{chr(10).join([f"{m['role']}: {m['content'][:200]}" for m in previous_messages[:-1]])}
-
-Latest question: {user_message}
-
-Standalone search query:"""
-            
-            contextualization_response = await async_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": contextualization_prompt}],
-                temperature=0.0,
-            )
-            
-            search_query = contextualization_response.choices[0].message.content.strip()
-            print(f"[RAG] Contextualized query: {user_message} -> {search_query}")
-            
-        except Exception as e:
-            print(f"[RAG] Error contextualizing query, using original: {e}")
-            search_query = user_message
-    
-    # Step 2: Perform combined search with contextualized query
-    yield {
-        "type": "search_start",
-        "message": "Searching your data..."
-    }
-    
+    # Perform combined search
     try:
-        context, references, raw_results = combined_search(
+        context, all_references, raw_results = combined_search(
             user_id=user_id,
-            query=search_query,
+            query=query,
             top_k=5
         )
-        
-        yield {
-            "type": "search_end",
-            "result_count": len(references)
-        }
+        process_steps.append({"step": "search", "result_count": len(all_references)})
         
     except Exception as e:
-        print(f"[RAG] Search error: {e}")
+        if verbose:
+            log(f"[RAG] Search error: {e}")
         context = ""
-        references = []
+        all_references = []
+        raw_results = []
     
-    # Signal that we're about to start generating response
-    yield {
-        "type": "generation_start",
-        "message": "Generating response..."
-    }
-    
-    # Step 3: Build RAG prompt with context
-    rag_prompt = build_rag_prompt(user_message, context, user_info)
-    
-    # Replace the last user message with the RAG-enhanced prompt
-    messages_copy = messages[:-1]  # Remove last user message
+    # Build RAG prompt with raw results
+    rag_prompt = build_rag_prompt(query, context, user_info, raw_results)
+    messages_copy = messages[:-1]
     messages_copy.append({"role": "user", "content": rag_prompt})
     
-    # Step 3: Stream response
-    stream = await async_client.chat.completions.create(
+    response = await async_client.chat.completions.create(
         model="gpt-4o",
         messages=messages_copy,
-        stream=True,
-        temperature=0.7,
+        temperature=0.3,
     )
     
-    async for chunk in stream:
-        delta = chunk.choices[0].delta
-        if delta.content:
-            yield {
-                "type": "content",
-                "content": delta.content,
-            }
+    llm_output = response.choices[0].message.content
     
-    # Step 4: Send references
-    if references:
-        yield {
-            "type": "references",
-            "references": references
-        }
+    # Parse LLM output to extract content and reference IDs
+    content = llm_output
+    selected_ids = []
     
-    yield {"type": "done"}
+    # Extract REFERENCE_IDS line
+    ref_match = re.search(r'REFERENCE_IDS:\s*(.+?)(?:\n|$)', llm_output, re.IGNORECASE)
+    if ref_match:
+        ref_line = ref_match.group(1).strip()
+        # Remove the REFERENCE_IDS line from content
+        content = re.sub(r'REFERENCE_IDS:.*?(?:\n|$)', '', llm_output, flags=re.IGNORECASE).strip()
+        
+        if ref_line.lower() != 'none':
+            # Parse comma-separated IDs
+            selected_ids = [id.strip() for id in ref_line.split(',') if id.strip()]
+    
+    # Import the helper function
+    from retrieval_service.react_agent_utils import fetch_full_reference
+    
+    # Fetch full reference data for selected IDs
+    selected_references = []
+    for ref_id in selected_ids:
+        try:
+            # Parse type and ID from format like "email_123" or just "123"
+            if '_' in ref_id:
+                ref_type, ref_db_id = ref_id.split('_', 1)
+            else:
+                # Try to find in raw_results
+                matching = [r for r in raw_results if str(r.get('id')) == ref_id]
+                if matching:
+                    ref_type = matching[0].get('type')
+                    ref_db_id = ref_id
+                else:
+                    continue
+            
+            # Fetch complete row from database
+            full_ref = fetch_full_reference(ref_type, ref_db_id)
+            if full_ref:
+                selected_references.append(full_ref)
+        
+        except Exception as e:
+            if verbose:
+                log(f"[RAG] Error fetching reference {ref_id}: {e}")
+            continue
+    
+    result = {
+        "content": content,
+        "references": selected_references
+    }
+    
+    if verbose:
+        result["process"] = process_steps
+        result["llm_selected_ids"] = selected_ids
+    
+    return result
 
 
-async def react_with_tools_stream(messages, user_id: str, max_iterations: int = 5):
+async def react_with_tools_direct(messages, user_id: str, max_iterations: int = 5):
     """
-    Persistent ReAct loop that keeps trying until it gets results or reaches max iterations.
+    ReAct loop with tool calling. Returns complete result as JSON.
     """
+    import os
+    verbose = os.getenv("VERBOSE_OUTPUT", "false").lower() == "true"
+    
     all_references = []
+    process_steps = []
     iteration = 0
     
     while iteration < max_iterations:
         iteration += 1
-        print(f"[AGENT] ReAct iteration {iteration}/{max_iterations}")
+        if verbose:
+            log(f"[AGENT] ReAct iteration {iteration}/{max_iterations}")
         
-        # ---------- Step: Call model with tools ----------
         response = await async_client.chat.completions.create(
             model="gpt-4o",
             messages=messages,
@@ -351,35 +354,23 @@ async def react_with_tools_stream(messages, user_id: str, max_iterations: int = 
         assistant_msg = response.choices[0].message
         tool_calls = assistant_msg.tool_calls or []
         
-        # If no tool calls, model is ready to respond
         if not tool_calls:
-            print(f"[AGENT] No more tool calls, ready to respond")
+            if verbose:
+                log(f"[AGENT] No more tool calls, ready to respond")
             messages.append(assistant_msg)
             break
         
-        # ---------- Execute tool calls ----------
         messages.append(assistant_msg)
         
         for tool_call in tool_calls:
             function_name = tool_call.function.name
             arguments = json.loads(tool_call.function.arguments or "{}")
 
-            # Send tool call start event
-            yield {
-                "type": "tool_call_start",
-                "tool": function_name,
-                "query": arguments.get('query', ''),
-                "search_types": arguments.get('search_types', [])
-            }
-
-            # Real tool execution
             tool_output = await execute_search_tool(function_name, arguments, user_id)
 
-            # Collect references
             if tool_output.get("references"):
                 all_references.extend(tool_output["references"])
 
-            # Send tool result back to model
             messages.append({
                 "role": "tool",
                 "tool_call_id": tool_call.id,
@@ -387,35 +378,26 @@ async def react_with_tools_stream(messages, user_id: str, max_iterations: int = 
                 "content": json.dumps(tool_output, ensure_ascii=False),
             })
 
-            # Send tool call end event
             result_count = len(tool_output.get("references", []))
-            yield {
-                "type": "tool_call_end",
+            process_steps.append({
+                "step": "tool_call",
                 "tool": function_name,
                 "result_count": result_count
-            }
-        
-        # Loop continues - model can decide to call more tools or respond
+            })
 
-    # ---------- Final: Stream the response ----------
-    stream = await async_client.chat.completions.create(
+    response = await async_client.chat.completions.create(
         model="gpt-4o",
         messages=messages,
-        stream=True,
     )
 
-    async for chunk in stream:
-        delta = chunk.choices[0].delta
-        if delta.content:
-            yield {
-                "type": "content",
-                "content": delta.content,
-            }
-
-    if all_references:
-        yield {
-            "type": "references",
-            "references": all_references
-        }
-
-    yield {"type": "done"}
+    content = response.choices[0].message.content
+    
+    result = {
+        "content": content,
+        "references": all_references
+    }
+    
+    if verbose:
+        result["process"] = process_steps
+    
+    return result

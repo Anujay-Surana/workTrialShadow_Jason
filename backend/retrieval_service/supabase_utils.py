@@ -286,3 +286,31 @@ def batch_insert_embeddings(embeddings: list):
     except Exception as e:
         print(f"Error batch inserting embeddings: {e}")
         return []
+
+def delete_user_and_all_data(user_id: str):
+    """Delete user and all associated data in the correct order."""
+    try:
+        # 1. Delete embeddings
+        supabase.table("embeddings").delete().eq("user_id", user_id).execute()
+
+        # 2. Delete attachments
+        supabase.table("attachments").delete().eq("user_id", user_id).execute()
+
+        # 3. Delete emails
+        supabase.table("emails").delete().eq("user_id", user_id).execute()
+
+        # 4. Delete schedules
+        supabase.table("schedules").delete().eq("user_id", user_id).execute()
+
+        # 5. Delete files
+        supabase.table("files").delete().eq("user_id", user_id).execute()
+
+        # 6. Finally delete user itself
+        supabase.table("users").delete().eq("uuid", user_id).execute()
+
+        print(f"Successfully deleted user {user_id} and all related data.")
+        return True
+
+    except Exception as e:
+        print(f"Error deleting user and related data: {e}")
+        return False
