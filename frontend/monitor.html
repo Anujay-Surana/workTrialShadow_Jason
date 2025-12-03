@@ -297,7 +297,7 @@
 
         function updateMonitoringDisplay(monitoring) {
             // Update risk level
-            const riskLevel = monitoring.risk_level;
+            const riskLevel = monitoring.risk_level || 0;
             const riskElement = document.getElementById('riskLevel');
             riskElement.textContent = riskLevel;
             riskElement.className = 'risk-level';
@@ -310,26 +310,31 @@
                 riskElement.classList.add('high');
             }
             
-            document.getElementById('riskReason').textContent = monitoring.risk_reason;
+            document.getElementById('riskReason').textContent = monitoring.risk_reason || 'No data';
             
-            // Update stats
-            document.getElementById('stat10min').textContent = monitoring.stats['10min'].total_requests;
-            document.getElementById('stat1hour').textContent = monitoring.stats['1hour'].total_requests;
-            document.getElementById('stat1day').textContent = monitoring.stats['1day'].total_requests;
-            document.getElementById('statErrors').textContent = monitoring.stats['1hour'].total_errors;
-            document.getElementById('statRetries').textContent = monitoring.stats['1hour'].total_retries;
+            // Update stats with safe defaults
+            const stats10min = monitoring.stats?.['10min'] || {};
+            const stats1hour = monitoring.stats?.['1hour'] || {};
+            const stats1day = monitoring.stats?.['1day'] || {};
             
-            // Update API breakdown
-            updateAPIBreakdown(monitoring.stats['1hour'].api_breakdown);
+            document.getElementById('stat10min').textContent = stats10min.total_requests || 0;
+            document.getElementById('stat1hour').textContent = stats1hour.total_requests || 0;
+            document.getElementById('stat1day').textContent = stats1day.total_requests || 0;
+            document.getElementById('statErrors').textContent = stats1hour.total_errors || 0;
+            document.getElementById('statRetries').textContent = stats1hour.total_retries || 0;
             
-            // Draw chart
-            drawTimelineChart(monitoring.timeline['1hour']);
+            // Update API breakdown with safe default
+            updateAPIBreakdown(stats1hour.api_breakdown || {});
+            
+            // Draw chart with safe default
+            drawTimelineChart(monitoring.timeline?.['1hour'] || []);
         }
 
         function updateAPIBreakdown(apiBreakdown) {
             const container = document.getElementById('apiBreakdown');
             
-            if (Object.keys(apiBreakdown).length === 0) {
+            // Handle null, undefined, or empty object
+            if (!apiBreakdown || typeof apiBreakdown !== 'object' || Object.keys(apiBreakdown).length === 0) {
                 container.innerHTML = '<div class="api-item"><span class="api-name">No data yet</span></div>';
                 return;
             }
@@ -340,9 +345,9 @@
                     <div class="api-item">
                         <span class="api-name">${api}</span>
                         <div class="api-stats">
-                            <span class="api-stat">Total: ${stats.total}</span>
-                            <span class="api-stat error">Errors: ${stats.errors}</span>
-                            <span class="api-stat retry">Retries: ${stats.retries}</span>
+                            <span class="api-stat">Total: ${stats.total || 0}</span>
+                            <span class="api-stat error">Errors: ${stats.errors || 0}</span>
+                            <span class="api-stat retry">Retries: ${stats.retries || 0}</span>
                         </div>
                     </div>
                 `;
