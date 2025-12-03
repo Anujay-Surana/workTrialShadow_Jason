@@ -10,16 +10,14 @@ All text generation and summarization operations use OpenAI API.
 """
 
 import os
+import re
 import json
 import time
 from typing import List
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
-from retrieval_service.core import SEARCH_TOOLS
-from retrieval_service.search.reference import parse_reference_ids, fetch_references_by_ids
 from retrieval_service.infrastructure.logging import log_debug, log_info, log_warning, log_error
 from retrieval_service.infrastructure.monitoring import monitor
-
 load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -70,16 +68,15 @@ async def chat_completion(messages: list, model: str = "gpt-4o", max_retries: in
                 raise
 
 
-async def rag_direct(messages, user_id: str, query: str, user_info: dict):
+async def rag(messages, user_id: str, query: str, user_info: dict):
     """
     Direct RAG mode: Perform retrieval and generate context summary.
     LLM decides which references to return.
     Returns complete result as JSON.
     """
+    # Lazy imports to avoid circular dependency
     from retrieval_service.core import combined_search, build_rag_prompt
-    from retrieval_service.data import supabase
-    import os
-    import re
+    from retrieval_service.search import parse_reference_ids, fetch_references_by_ids
     
     verbose = os.getenv("VERBOSE_OUTPUT", "false").lower() == "true"
     process_steps = []
@@ -130,20 +127,45 @@ async def rag_direct(messages, user_id: str, query: str, user_info: dict):
     return result
 
 
-async def react_with_tools_direct(messages, user_id: str, max_iterations: int = 5):
+async def mixed_agent(messages, user_id: str, query: str, user_info: dict, max_iterations: int = 5):
     """
     Mixed mode: RAG with tool calling.
+    - Starts with initial RAG search
     - AI can call search tools multiple times
     - AI outputs REFERENCE_IDS in the final response
     - Program parses REFERENCE_IDS and fetches full data
     """
-    from retrieval_service.search import execute_search_tool
-    import os
-    import re
+    # Lazy imports to avoid circular dependency
+    from retrieval_service.core import SEARCH_TOOLS, combined_search, build_rag_prompt
+    from retrieval_service.search import parse_reference_ids, fetch_references_by_ids, execute_search_tool
+    
     verbose = os.getenv("VERBOSE_OUTPUT", "false").lower() == "true"
     
     all_raw_results = []  # Collect all search results for ID lookup
     process_steps = []
+    
+    # Perform initial combined search (RAG)
+    try:
+        context, all_references, raw_results = combined_search(
+            user_id=user_id,
+            query=query,
+            top_k=5
+        )
+        process_steps.append({"step": "search", "result_count": len(all_references)})
+        all_raw_results.extend(raw_results)
+        
+    except Exception as e:
+        if verbose:
+            log_warning(f"[MIXED] Initial search error: {e}")
+        context = ""
+        all_references = []
+        raw_results = []
+    
+    # Build RAG prompt with raw results
+    rag_prompt = build_rag_prompt(query, context, user_info, raw_results)
+    messages_copy = messages[:-1]
+    messages_copy.append({"role": "user", "content": rag_prompt})
+    
     iteration = 0
     
     # Tool calling loop
@@ -158,7 +180,7 @@ async def react_with_tools_direct(messages, user_id: str, max_iterations: int = 
             try:
                 response = await async_client.chat.completions.create(
                     model="gpt-4o",
-                    messages=messages,
+                    messages=messages_copy,
                     tools=SEARCH_TOOLS,
                     tool_choice="auto",
                 )
@@ -182,12 +204,13 @@ async def react_with_tools_direct(messages, user_id: str, max_iterations: int = 
         tool_calls = assistant_msg.tool_calls or []
         
         if not tool_calls:
+            # AI has finished and provided final response
             if verbose:
-                log_debug(f"[MIXED] No more tool calls, ready to respond")
-            messages.append(assistant_msg)
+                log_debug(f"[MIXED] No more tool calls, AI provided final response")
+            llm_output = assistant_msg.content
             break
         
-        messages.append(assistant_msg)
+        messages_copy.append(assistant_msg)
         
         for tool_call in tool_calls:
             function_name = tool_call.function.name
@@ -209,7 +232,7 @@ async def react_with_tools_direct(messages, user_id: str, max_iterations: int = 
             if not tool_output.get("ok"):
                 simplified_output["error"] = tool_output.get("error", "Unknown error")
 
-            messages.append({
+            messages_copy.append({
                 "role": "tool",
                 "tool_call_id": tool_call.id,
                 "name": function_name,
@@ -222,9 +245,11 @@ async def react_with_tools_direct(messages, user_id: str, max_iterations: int = 
                 "tool": function_name,
                 "result_count": result_count
             })
-
-    # Final response generation with retry logic
-    llm_output = await chat_completion(messages, model="gpt-4o")
+    else:
+        # Loop ended due to max iterations, need final completion
+        if verbose:
+            log_debug(f"[MIXED] Max iterations reached, generating final response")
+        llm_output = await chat_completion(messages_copy, model="gpt-4o")
     
     # Parse REFERENCE_IDS from LLM output
     content, selected_ids = parse_reference_ids(llm_output)

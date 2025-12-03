@@ -34,6 +34,7 @@ from models import (
     ErrorResponse,
     SuccessResponse
 )
+from retrieval_service.core import REACT_SYSTEM_PROMPT, MIXED_MODE_SYSTEM_PROMPT, RAG_SYSTEM_PROMPT
 
 load_dotenv()
 
@@ -687,61 +688,37 @@ async def memory_retrieval(request: Request):
         # Build system prompt based on mode
         if mode == "react":
             # ReAct mode: use tool-calling prompt (no REFERENCE_IDS required)
-            from retrieval_service.core import REACT_SYSTEM_PROMPT
             system_content = (
                 f"Current date and time: {current_datetime} ({weekday_name}).\n"
                 f"User: {user_info.get('name')} ({user_info.get('email')})\n\n"
                 f"{REACT_SYSTEM_PROMPT}"
             )
-            user_prompt = f"Query: {query}"
+            
+        if mode == "mixed":
+            # Mixed Mode: RAG by default, LLM decides usage of tools
+            system_content = (
+                f"Current date and time: {current_datetime} ({weekday_name}).\n"
+                f"User: {user_info.get('name')} ({user_info.get('email')})\n\n"
+                f"{MIXED_MODE_SYSTEM_PROMPT}"
+            )
         else:
             # For RAG mode: use direct retrieval prompt with REFERENCE_IDS format
             system_content = (
-                f"You are a memory retrieval module that extracts factual context from user data.\n"
                 f"Current date and time: {current_datetime} ({weekday_name}).\n"
                 f"User: {user_info.get('name')} ({user_info.get('email')})\n\n"
-                f"CRITICAL INSTRUCTIONS:\n"
-                f"1. Write in THIRD-PERSON perspective (describe what exists in the data)\n"
-                f"2. Do NOT use first-person ('I found', 'I see') - use third-person ('User has', 'Data contains', 'Records show')\n"
-                f"3. Keep responses SHORT - maximum 3-4 sentences or bullet points\n"
-                f"4. Extract ONLY factual information, no opinions or advice\n"
-                f"5. Focus on: dates, people, actions, deadlines, key facts\n"
-                f"6. If no relevant data exists, state it objectively\n\n"
-                f"OUTPUT FORMAT:\n"
-                f"First line: Objective summary of what data exists\n"
-                f"Following lines: Key facts in bullet points (if multiple)\n"
-                f"Last line: REFERENCE_IDS: [comma-separated list of source IDs]\n\n"
-                f"CORRECT EXAMPLES:\n"
-                f"✓ 'User has 2 emails about project deadline from Sarah.'\n"
-                f"✓ 'Data contains meeting scheduled for Dec 5, 2PM.'\n"
-                f"✓ 'Records show budget proposal due Dec 3.'\n"
-                f"✓ 'No relevant information exists in user data.'\n\n"
-                f"INCORRECT EXAMPLES:\n"
-                f"✗ 'I found 2 emails about project deadline.'\n"
-                f"✗ 'I see you have a meeting on Dec 5.'\n"
-                f"✗ 'Let me help you with that.'\n"
-                f"✗ 'Here's what I discovered...'\n\n"
-                f"Example output:\n"
-                f"User has 2 emails about project deadline from Sarah.\n"
-                f"- Meeting scheduled Dec 5, 2PM with Sarah\n"
-                f"- Budget proposal due Dec 3\n"
-                f"REFERENCE_IDS: email_123, email_456, event_789\n\n"
-                f"If no data found:\n"
-                f"No relevant information exists in user's personal data.\n"
-                f"REFERENCE_IDS: none\n"
+                f"{RAG_SYSTEM_PROMPT}"
             )
-            user_prompt = f"Query: {query}\n\nExtract factual context in third-person perspective with relevant REFERENCE_IDS."
-
+        user_prompt = f"Query: {query}"
         system_message = {"role": "system", "content": system_content}
         messages = [system_message, {"role": "user", "content": user_prompt}]
 
         if mode == "react":
-            from retrieval_service.core import react_agent_direct
-            result = await react_agent_direct(messages, user_id)
+            from retrieval_service.core import react_agent
+            result = await react_agent(messages, user_id)
         elif mode == "mixed":
-            result = await openai_client.react_with_tools_direct(messages, user_id)
+            result = await openai_client.mixed_agent(messages, user_id, query, user_info)
         else:
-            result = await openai_client.rag_direct(messages, user_id, query, user_info)
+            result = await openai_client.rag(messages, user_id, query, user_info)
 
         monitor.log_request('api', f'memory_retrieval_{mode}', 'success', 0)
         return JSONResponse(result)
@@ -780,7 +757,7 @@ Returns a streaming response with appropriate content type and filename.
     """,
     tags=["Downloads"]
 )
-async def download_drive_file_direct(file_id: str, request: Request):
+async def download_drive_file(file_id: str, request: Request):
     """Server-side Google Drive download using user OAuth"""
     credentials = get_credentials_from_cookies(request)
     if not credentials:
@@ -855,7 +832,7 @@ The attachment is fetched from Gmail and streamed to the client with appropriate
     """,
     tags=["Downloads"]
 )
-async def download_attachment_direct(attachment_id: str, request: Request):
+async def download_attachment(attachment_id: str, request: Request):
     """
     Server-side Gmail attachment download.
     Works for ANY attachment (images, PDF, docx, zip...).

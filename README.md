@@ -432,10 +432,10 @@ The `retrieval_service` package is organized by responsibility:
 ```python
 # Core functionality
 from retrieval_service.core.rag import combined_search, build_rag_prompt
-from retrieval_service.core.react import react_agent_direct
+from retrieval_service.core.react import react_agent
 
 # API clients
-from retrieval_service.api.openai_client import rag_direct, chat_completion
+from retrieval_service.api.openai_client import rag, chat_completion
 from retrieval_service.api.gemini_client import embed_text
 from retrieval_service.api.google_client import fetch_gmail_messages
 

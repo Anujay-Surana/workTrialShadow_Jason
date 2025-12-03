@@ -88,8 +88,8 @@ def test_react_mode_imports_successfully(dummy):
     This ensures the core ReAct functionality is accessible.
     """
     try:
-        from retrieval_service.core import react_agent_direct, parse_action
-        assert callable(react_agent_direct), "react_agent_direct should be callable"
+        from retrieval_service.core import react_agent, parse_action
+        assert callable(react_agent), "react_agent should be callable"
         assert callable(parse_action), "parse_action should be callable"
     except ImportError as e:
         pytest.fail(f"Failed to import ReAct components: {e}")
@@ -190,14 +190,14 @@ def test_react_functions_have_correct_signatures(dummy):
     This ensures the API contract is maintained.
     """
     import inspect
-    from retrieval_service.core import react_agent_direct, parse_action
+    from retrieval_service.core import react_agent, parse_action
     
-    # Check react_agent_direct signature
-    sig = inspect.signature(react_agent_direct)
+    # Check react_agent signature
+    sig = inspect.signature(react_agent)
     params = list(sig.parameters.keys())
     
-    assert 'messages' in params, "react_agent_direct missing messages parameter"
-    assert 'user_id' in params, "react_agent_direct missing user_id parameter"
+    assert 'messages' in params, "react_agent missing messages parameter"
+    assert 'user_id' in params, "react_agent missing user_id parameter"
     
     # Check parse_action signature
     sig = inspect.signature(parse_action)
@@ -273,7 +273,7 @@ def test_core_module_exports_all_required_functions(dummy):
         'REACT_SYSTEM_PROMPT',
         'combined_search',
         'build_rag_prompt',
-        'react_agent_direct',
+        'react_agent',
         'parse_action',
     ]
     

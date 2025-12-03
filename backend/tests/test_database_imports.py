@@ -48,7 +48,7 @@ class TestDatabaseImports:
         # Test User Deletion
         assert hasattr(data, 'delete_user_and_all_data')
     
-    def test_direct_imports_from_data(self):
+    def test_imports_from_data(self):
         """Test that functions can be imported directly from data module."""
         from retrieval_service.data import (
             supabase,
@@ -85,7 +85,7 @@ class TestDatabaseImports:
         assert callable(delete_user_and_all_data)
         assert supabase is not None
     
-    def test_database_module_direct_import(self):
+    def test_database_module_import(self):
         """Test that database.py module can be imported directly."""
         from retrieval_service.data import database
         

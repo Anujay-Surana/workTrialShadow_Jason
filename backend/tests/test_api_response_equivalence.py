@@ -312,17 +312,17 @@ def test_module_structure_equivalence():
     """
     # Core functions
     from retrieval_service import SEARCH_TOOLS, REACT_SYSTEM_PROMPT
-    from retrieval_service.core.agent import SEARCH_TOOLS as new_tools
-    from retrieval_service.core.agent import REACT_SYSTEM_PROMPT as new_prompt
+    from retrieval_service.core.mixed import SEARCH_TOOLS as new_tools
+    from retrieval_service.core.mixed import REACT_SYSTEM_PROMPT as new_prompt
     assert SEARCH_TOOLS is new_tools
     assert REACT_SYSTEM_PROMPT is new_prompt
     
     # API functions
-    from retrieval_service import rag_direct, react_with_tools_direct
-    from retrieval_service.api.openai_client import rag_direct as new_rag
-    from retrieval_service.api.openai_client import react_with_tools_direct as new_react
-    assert rag_direct is new_rag
-    assert react_with_tools_direct is new_react
+    from retrieval_service import rag, mixed_agent
+    from retrieval_service.api.openai_client import rag as new_rag
+    from retrieval_service.api.openai_client import mixed_agent as new_react
+    assert rag is new_rag
+    assert mixed_agent is new_react
     
     # Search functions
     from retrieval_service import vector_search

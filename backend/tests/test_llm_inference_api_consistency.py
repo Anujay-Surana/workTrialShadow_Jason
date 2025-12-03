@@ -180,12 +180,12 @@ def test_openai_client_exists():
     Verify that the OpenAI client module exists and exports LLM functions.
     """
     try:
-        from retrieval_service.api.openai_client import chat_completion, rag_direct, react_with_tools_direct
+        from retrieval_service.api.openai_client import chat_completion, rag, mixed_agent
         
         # Check that the functions exist
         assert callable(chat_completion), "chat_completion should be a callable function"
-        assert callable(rag_direct), "rag_direct should be a callable function"
-        assert callable(react_with_tools_direct), "react_with_tools_direct should be a callable function"
+        assert callable(rag), "rag should be a callable function"
+        assert callable(mixed_agent), "mixed_agent should be a callable function"
         
     except ImportError as e:
         pytest.fail(f"Failed to import OpenAI client: {e}")
@@ -196,11 +196,11 @@ def test_api_module_exports_openai_functions():
     Verify that the API module exports OpenAI LLM functions.
     """
     try:
-        from retrieval_service.api import chat_completion, rag_direct, react_with_tools_direct
+        from retrieval_service.api import chat_completion, rag, mixed_agent
         
         assert callable(chat_completion), "chat_completion should be exported from api module"
-        assert callable(rag_direct), "rag_direct should be exported from api module"
-        assert callable(react_with_tools_direct), "react_with_tools_direct should be exported from api module"
+        assert callable(rag), "rag should be exported from api module"
+        assert callable(mixed_agent), "mixed_agent should be exported from api module"
         
     except ImportError as e:
         pytest.fail(f"Failed to import OpenAI functions from api module: {e}")

@@ -14,7 +14,7 @@ def test_core_imports():
     # New style: from retrieval_service import SEARCH_TOOLS
     from retrieval_service import SEARCH_TOOLS, REACT_SYSTEM_PROMPT
     from retrieval_service import combined_search, deduplicate_results, build_rag_prompt
-    from retrieval_service import react_agent_direct, parse_action
+    from retrieval_service import react_agent, parse_action
     from retrieval_service import execute_search_tool, execute_search_tool_with_results
     
     assert SEARCH_TOOLS is not None
@@ -22,7 +22,7 @@ def test_core_imports():
     assert callable(combined_search)
     assert callable(deduplicate_results)
     assert callable(build_rag_prompt)
-    assert callable(react_agent_direct)
+    assert callable(react_agent)
     assert callable(parse_action)
     assert callable(execute_search_tool)
     assert callable(execute_search_tool_with_results)
@@ -30,7 +30,7 @@ def test_core_imports():
 
 def test_api_imports():
     """Test that API client functions can be imported from retrieval_service root"""
-    from retrieval_service import chat_completion, rag_direct, react_with_tools_direct
+    from retrieval_service import chat_completion, rag, mixed_agent
     from retrieval_service import embed_text
     from retrieval_service import (
         fetch_gmail_messages,
@@ -45,8 +45,8 @@ def test_api_imports():
     )
     
     assert callable(chat_completion)
-    assert callable(rag_direct)
-    assert callable(react_with_tools_direct)
+    assert callable(rag)
+    assert callable(mixed_agent)
     assert callable(embed_text)
     assert callable(fetch_gmail_messages)
     assert callable(extract_attachments)
@@ -189,10 +189,10 @@ def test_old_module_imports_still_work():
 
 def test_new_module_imports_work():
     """Test that importing from new module paths works"""
-    from retrieval_service.core.agent import SEARCH_TOOLS
+    from retrieval_service.core.mixed import SEARCH_TOOLS
     from retrieval_service.core.rag import combined_search
-    from retrieval_service.core.react import react_agent_direct
-    from retrieval_service.api.openai_client import rag_direct
+    from retrieval_service.core.react import react_agent
+    from retrieval_service.api.openai_client import rag
     from retrieval_service.api.gemini_client import embed_text
     from retrieval_service.search.vector import vector_search
     from retrieval_service.data.database import get_user_by_email
@@ -201,8 +201,8 @@ def test_new_module_imports_work():
     
     assert SEARCH_TOOLS is not None
     assert callable(combined_search)
-    assert callable(react_agent_direct)
-    assert callable(rag_direct)
+    assert callable(react_agent)
+    assert callable(rag)
     assert callable(embed_text)
     assert callable(vector_search)
     assert callable(get_user_by_email)

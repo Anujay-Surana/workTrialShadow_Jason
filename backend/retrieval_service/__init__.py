@@ -18,21 +18,23 @@ New structure:
 # ======================================================
 
 # From core/agent.py
-from .core.agent import SEARCH_TOOLS, REACT_SYSTEM_PROMPT
+from .core.mixed import SEARCH_TOOLS, MIXED_MODE_SYSTEM_PROMPT
 
 # From core/rag.py
 from .core.rag import (
     combined_search,
     deduplicate_results,
-    build_rag_prompt
+    build_rag_prompt,
+    RAG_SYSTEM_PROMPT
 )
 
 # From core/react.py
 from .core.react import (
-    react_agent_direct,
+    react_agent,
     parse_action,
     execute_search_tool,
-    execute_search_tool_with_results
+    execute_search_tool_with_results,
+    REACT_SYSTEM_PROMPT
 )
 
 # ======================================================
@@ -42,8 +44,8 @@ from .core.react import (
 # From api/openai_client.py
 from .api.openai_client import (
     chat_completion,
-    rag_direct,
-    react_with_tools_direct
+    rag,
+    mixed_agent
 )
 
 # From api/gemini_client.py
@@ -174,25 +176,27 @@ from .infrastructure.batch import (
 # ======================================================
 
 # These aliases ensure that old import patterns continue to work
-# Example: from retrieval_service.openai_api_utils import rag_direct
-# Now works as: from retrieval_service import rag_direct
+# Example: from retrieval_service.openai_api_utils import rag
+# Now works as: from retrieval_service import rag
 
 __all__ = [
     # Core
     'SEARCH_TOOLS',
     'REACT_SYSTEM_PROMPT',
+    'RAG_SYSTEM_PROMPT',
+    'MIXED_MODE_SYSTEM_PROMPT',
     'combined_search',
     'deduplicate_results',
     'build_rag_prompt',
-    'react_agent_direct',
+    'react_agent',
     'parse_action',
     'execute_search_tool',
     'execute_search_tool_with_results',
     
     # API
     'chat_completion',
-    'rag_direct',
-    'react_with_tools_direct',
+    'rag',
+    'mixed_agent',
     'embed_text',
     'fetch_gmail_messages',
     'extract_attachments',
